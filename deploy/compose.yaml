@@ -1,0 +1,35 @@
+# b-sandbox container definition.
+#
+# Published on the host loopback only: nginx is the public facade (/b-sandbox/).
+# The backend creates user/mount/pid/network namespaces from inside this
+# container; Docker's default seccomp profile blocks those syscalls for an
+# unprivileged container, so the profile is lifted here. Everything else
+# stays least-privilege: no capabilities, read-only rootfs, one writable
+# volume under the data root. If the kernel refuses unprivileged user
+# namespaces the service aborts at startup (fail closed) instead of serving
+# a weaker isolation tier.
+services:
+  b-sandbox:
+    image: b-sandbox:${B_SANDBOX_TAG:-latest}
+    container_name: b-sandbox
+    restart: unless-stopped
+    ports:
+      - "${B_SANDBOX_BIND:-127.0.0.1}:${B_SANDBOX_PORT:-8094}:8094"
+    volumes:
+      - ${B_SANDBOX_DATA_DIR:-/opt/b-sandbox/data}:/app/data
+    environment:
+      TZ: Asia/Shanghai
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      # bubblewrap needs clone/unshare with namespace flags. A narrower
+      # custom profile can replace this once measured on the server.
+      - seccomp:unconfined
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
