@@ -480,7 +480,14 @@ components:
         net:
           type: object
           properties:
-            egress:
+            proxy:
+              type: boolean
+              description: |
+                Route all egress through the service credential-injection proxy.
+                The workload gets exactly one network hole (the proxy) and
+                standard proxy env vars; credentials live in the proxy, never
+                in the sandbox. Rejects allow/deny lists and an allow default.
+                Requires the backend NET_EGRESS_PROXY capability (seatbelt tier).
               type: object
               properties:
                 mode: { type: string, enum: [deny, allow] }

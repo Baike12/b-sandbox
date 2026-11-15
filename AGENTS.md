@@ -11,7 +11,7 @@ b-sandbox is a sandbox service for [b-superagent](../b-superagent): it runs untr
 
 ## Project Structure
 
-Keep this table honest as code lands. Entry point: `sandbox-api --data-root <dir> [--port 8094] [--backend seatbelt|bwrap]`.
+Keep this table honest as code lands. Entry point: `sandbox-api --data-root <dir> [--port 8094] [--bind <addr>] [--backend seatbelt|bwrap] [--auth-token <t|env B_SANDBOX_AUTH_TOKEN>] [--egress-proxy <addr> --egress-credentials <file.json>]`.
 
 ```
 crates/                          Rust workspace
@@ -46,7 +46,13 @@ vendor/                          reference open-source sandboxes — read-only, 
 scripts/gate.sh                  fmt + clippy -D warnings + test --workspace
 deploy/                          Dockerfile, compose.yaml, nginx snippet, server_setup/remote_run
 scripts/deploy.sh                cross-compile (musl/zig) → scp → server docker build → compose up
-web/, sdk/                       not yet (M3+: console, client SDK)
+crates/sandbox-egress-proxy/     credential-injection egress proxy (lib + standalone bin);
+                                 net.proxy sandboxes get one loopback hole + proxy env vars
+crates/sandbox-sdk/              typed Rust client; live-TCP tests against the real router
+docs/openapi.yaml                versioned API contract; tests/contract.rs locks routes+codes
+deploy/                          Dockerfile, compose.yaml, nginx snippet, server_setup/remote_run
+scripts/deploy.sh                cross-compile (musl/zig) → scp → server docker build → compose up
+web/                             not yet (M3+: console)
 ```
 
 ### Key Concepts

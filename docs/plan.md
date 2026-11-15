@@ -116,4 +116,17 @@ Same loop as M1: implement → tests → `scripts/gate.sh` → commit. One commi
 | **P-5 OpenAPI + contract tests** | `docs/openapi.yaml` (hand-written, versioned) + a contract test that asserts every registered route exists in the spec with matching error codes | Route/spec drift fails the gate |
 | **P-6 perf gate** | Startup latency and exec round-trip gate tests, calibrated from measured baselines, order-of-magnitude bounds | Gate tests run in CI without flaking |
 
-Recorded but deferred further: cgroups-v2 memory enforcement for bwrap (needs Linux host evidence; capability bit stays undeclared until a test proves enforcement), e2b SDK driver over the API (envd-protocol bridge belongs with the M3 microVM in-guest agent), SSE streaming, Rust client SDK.
+## 7. M3/M4 status (2026-11-15)
+
+**M4 shipped.** Templates + reflink snapshots (`clonefile`/`FICLONE`, copy
+fallback), the commit endpoint, the credential-injection egress proxy with
+the `net.proxy` policy (Seatbelt per-port hole proven live: allowed target
+connects, direct egress denied), the Rust client SDK (live-TCP tests), the
+SSE event stream, and optional bearer-token auth.
+
+**M3 designed, not implemented** — see [m3-microvm.md](./m3-microvm.md).
+libkrun cannot compile, link, or run on this macOS host, so no isolation
+code without enforcement evidence was written; the design is complete and
+the adversarial acceptance suite is already specified.
+
+Recorded but deferred further: cgroups-v2 memory enforcement for bwrap (needs Linux host evidence; capability bit stays undeclared until a test proves enforcement), e2b SDK driver over the API (envd-protocol bridge belongs with the M3 microVM in-guest agent).

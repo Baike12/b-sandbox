@@ -2,7 +2,9 @@
 //!
 //! Usage:
 //! ```text
-//! sandbox-api --data-root <dir> [--port 8094] [--bind <addr>] [--backend seatbelt|bwrap]
+//! sandbox-api --data-root <dir> [--port 8094] [--bind <addr>]
+//!             [--backend seatbelt|bwrap] [--auth-token <token>]
+//!             [--egress-proxy <ip:port> --egress-credentials <file.json>]
 //! ```
 //!
 //! Default bind is `127.0.0.1` (the dev posture: nothing exposed). A
