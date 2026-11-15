@@ -520,6 +520,61 @@ async fn events_after_cursor_reads_forward() {
     assert_eq!(events[0]["seq"], 3);
 }
 
+// ---------- usage ledger ----------
+
+#[tokio::test]
+async fn usage_ledger_tracks_a_full_cycle() {
+    let app = app(MockBackend::available());
+    let (app, id) = create_sandbox(app).await;
+
+    // One exec: mock stdout is `mock ran "echo"` — 15 bytes.
+    let (status, _) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/exec"),
+        Some(json!({"command": "echo"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Two file ops that count; one denied op that must not.
+    let (status, _) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/files/write"),
+        Some(json!({"path": "notes.txt", "content": "hi"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/files/read"),
+        Some(json!({"path": "notes.txt"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/files/read"),
+        Some(json!({"path": "missing.txt"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = call(app, "GET", &format!("/sandboxes/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let usage = &body["usage"];
+    assert_eq!(usage["execsStarted"], 1);
+    assert_eq!(usage["execsFinished"], 1);
+    assert_eq!(usage["execsTimedOut"], 0);
+    assert_eq!(usage["outputBytes"], 15);
+    assert_eq!(usage["fileOps"], 2);
+    assert!(usage["createdAtMs"].as_u64().unwrap() > 0);
+    assert!(usage["lastActivityMs"].as_u64().unwrap() >= usage["createdAtMs"].as_u64().unwrap());
+}
+
 // ---------- macOS end-to-end with the real backend ----------
 
 #[cfg(target_os = "macos")]

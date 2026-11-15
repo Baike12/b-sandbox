@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use sandbox_core::{EventLog, Lifecycle, SandboxBackend, SandboxContext};
 
+use crate::ledger::{UsageLedger, now_ms};
+
 pub type SharedState = Arc<AppState>;
 
 pub struct AppState {
@@ -30,6 +32,8 @@ pub struct SandboxRecord {
     pub ctx: SandboxContext,
     pub lifecycle: Mutex<Lifecycle>,
     pub events: Mutex<EventLog>,
+    /// Accounting side of the budget: what happened through the API.
+    pub usage: Mutex<UsageLedger>,
 }
 
 impl SandboxRecord {
@@ -38,6 +42,7 @@ impl SandboxRecord {
             ctx,
             lifecycle: Mutex::new(Lifecycle::new()),
             events: Mutex::new(EventLog::new()),
+            usage: Mutex::new(UsageLedger::new(now_ms())),
         }
     }
 }

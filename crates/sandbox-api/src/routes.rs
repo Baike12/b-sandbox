@@ -14,6 +14,7 @@ use serde_json::json;
 
 use crate::error::{ApiError, ApiJson, ApiResult, backend_unavailable, sandbox_not_found};
 use crate::files::resolve_sandbox_path;
+use crate::ledger::now_ms;
 use crate::state::{SandboxRecord, SharedState, new_sandbox_id};
 use sandbox_core::events::EventKind;
 use sandbox_core::{Error, ExecOutcome, LifecycleState};
@@ -134,12 +135,23 @@ async fn list_sandboxes(State(state): State<SharedState>) -> Json<serde_json::Va
     Json(json!({ "sandboxes": sandboxes }))
 }
 
+/// Detail view: the summary view flattened plus the usage ledger.
+#[derive(Debug, Serialize)]
+struct SandboxDetailView {
+    #[serde(flatten)]
+    sandbox: SandboxView,
+    usage: crate::ledger::UsageLedger,
+}
+
 async fn get_sandbox(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<SandboxView>> {
+) -> ApiResult<Json<SandboxDetailView>> {
     let record = state.get(&id).ok_or_else(|| sandbox_not_found(&id))?;
-    Ok(Json(view_of(&record)))
+    Ok(Json(SandboxDetailView {
+        sandbox: view_of(&record),
+        usage: record.usage.lock().unwrap().clone(),
+    }))
 }
 
 async fn delete_sandbox(
@@ -222,8 +234,18 @@ async fn exec(
         .lock()
         .unwrap()
         .push(EventKind::ExecStarted, json!({"command": request.command}));
+    record.usage.lock().unwrap().record_exec_started(now_ms());
 
+    let started = std::time::Instant::now();
     let outcome = state.backend.exec(&record.ctx, request.clone()).await?;
+    let wall_ms = started.elapsed().as_millis() as u64;
+    let output_bytes = outcome.stdout.len() + outcome.stderr.len();
+    record.usage.lock().unwrap().record_exec_outcome(
+        outcome.timed_out,
+        wall_ms,
+        output_bytes,
+        now_ms(),
+    );
 
     let (kind, data) = if outcome.timed_out {
         (
@@ -278,6 +300,11 @@ fn require_running(record: &SandboxRecord, id: &str) -> ApiResult<()> {
     }
 }
 
+/// One successful file operation = one counted operation.
+fn record_file_op(record: &SandboxRecord) {
+    record.usage.lock().unwrap().record_file_op(now_ms());
+}
+
 async fn file_read(
     State(state): State<SharedState>,
     Path(id): Path<String>,
@@ -289,6 +316,7 @@ async fn file_read(
     let content = tokio::fs::read(&path)
         .await
         .map_err(|e| io_error(e, &path))?;
+    record_file_op(&record);
     Ok(Json(json!({
         "path": body.path,
         "contentBase64": crate::b64::encode(&content),
@@ -315,6 +343,7 @@ async fn file_write(
     tokio::fs::write(&path, body.content.as_bytes())
         .await
         .map_err(|e| io_error(e, &path))?;
+    record_file_op(&record);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -353,6 +382,7 @@ async fn file_list(
         }));
     }
     entries.sort_by_key(|e| e["name"].as_str().unwrap_or("").to_string());
+    record_file_op(&record);
     Ok(Json(json!({ "entries": entries })))
 }
 
@@ -367,6 +397,7 @@ async fn file_stat(
     let meta = tokio::fs::metadata(&path)
         .await
         .map_err(|e| io_error(e, &path))?;
+    record_file_op(&record);
     Ok(Json(json!({
         "path": body.path,
         "type": if meta.is_dir() { "dir" } else { "file" },
@@ -385,6 +416,7 @@ async fn file_mkdir(
     tokio::fs::create_dir_all(&path)
         .await
         .map_err(|e| io_error(e, &path))?;
+    record_file_op(&record);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -414,6 +446,7 @@ async fn file_remove(
             .await
             .map_err(|e| io_error(e, &path))?;
     }
+    record_file_op(&record);
     Ok(StatusCode::NO_CONTENT)
 }
 
