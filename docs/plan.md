@@ -103,6 +103,8 @@ TTL/pause, snapshots, templates beyond `scratch`, SSE, OpenAPI generation, SDK c
 
 ## 6. M2 module plan (production hardening)
 
+Status: **landed.** Modules P-1 through P-6 are implemented and committed; the gate is green (15 suites, ~170 tests, including 6 contract tests and 2 calibrated perf gates). Measured baselines on the reference dev machine (2026-11-15): seatbelt echo exec 5.2 ms mean (budget 50 ms), API create+exec+detail+delete cycle 0.195 ms (budget 2 ms). serde finding: `#[serde(flatten)]` silently disables `deny_unknown_fields`, so the create body is parsed via explicit envelope extraction + `from_value` into the spec (see routes.rs `parse_create_body`).
+
 Same loop as M1: implement → tests → `scripts/gate.sh` → commit. One commit per module.
 
 | Module | Ships | Done when |

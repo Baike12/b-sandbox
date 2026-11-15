@@ -32,7 +32,10 @@ crates/                          Rust workspace
 │   ├── profile.rs               policy → argv (pure fn, unit-tested)
 │   └── tests/integration.rs     linux-gated; runs only where bwrap exists
 ├── sandbox-api/                 axum REST service (lib + thin bin in main.rs)
-│   ├── routes.rs                lifecycle/exec/files/events/health handlers
+│   ├── routes.rs                route table (single source) + lifecycle/exec/files handlers
+│   ├── ledger.rs                per-sandbox usage accounting (exec/file ops)
+│   ├── reaper.rs                idle-TTL sweep (pure query + shared termination path)
+│   ├── metrics.rs               Prometheus text format, hand-rolled, lock-free
 │   ├── files.rs                 sandbox-relative path resolution (traversal +
 │   │                            symlink escapes are policy_validation errors)
 │   ├── state.rs                 registry (Arc records), id minting, idempotency
@@ -41,7 +44,9 @@ crates/                          Rust workspace
 docs/                            design docs and RFCs (design.md 中文, plan.md English)
 vendor/                          reference open-source sandboxes — read-only, see vendor/README.md
 scripts/gate.sh                  fmt + clippy -D warnings + test --workspace
-web/, deploy/, sdk/              not yet (M2+: console, deploy pipeline, client SDK)
+deploy/                          Dockerfile, compose.yaml, nginx snippet, server_setup/remote_run
+scripts/deploy.sh                cross-compile (musl/zig) → scp → server docker build → compose up
+web/, sdk/                       not yet (M3+: console, client SDK)
 ```
 
 ### Key Concepts
