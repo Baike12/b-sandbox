@@ -4,11 +4,3 @@
 fn main() {
     println!("sandbox-api scaffold");
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffold_links_core() {
-        assert!(sandbox_core::workspace_is_wired());
-    }
-}

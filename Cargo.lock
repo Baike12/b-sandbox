@@ -380,7 +380,6 @@ dependencies = [
  "sandbox-core",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 
