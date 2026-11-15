@@ -154,6 +154,20 @@ async fn call(
     (status, value)
 }
 
+/// Like `call`, but returns the raw body text — for non-JSON endpoints
+/// such as the Prometheus exposition format.
+async fn call_raw(app: axum::Router, method: &str, uri: &str) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn create_body() -> Value {
     json!({})
 }
@@ -720,9 +734,8 @@ async fn metrics_move_in_lockstep_with_the_lifecycle() {
     )
     .await;
 
-    let (status, body) = call(app.clone(), "GET", "/metrics", None).await;
+    let (status, text) = call_raw(app.clone(), "GET", "/metrics").await;
     assert_eq!(status, StatusCode::OK);
-    let text = body.as_str().unwrap_or("");
     assert!(
         text.contains("bsandbox_sandboxes_created_total 1"),
         "{text}"
@@ -737,8 +750,7 @@ async fn metrics_move_in_lockstep_with_the_lifecycle() {
     assert!(text.contains("bsandbox_file_ops_total 1"), "{text}");
 
     call(app.clone(), "DELETE", &format!("/sandboxes/{id}"), None).await;
-    let (_, body) = call(app, "GET", "/metrics", None).await;
-    let text = body.as_str().unwrap_or("");
+    let (_, text) = call_raw(app, "GET", "/metrics").await;
     assert!(
         text.contains("bsandbox_sandboxes_terminated_total 1"),
         "{text}"
