@@ -17,11 +17,10 @@ pub use net::{EgressDefault, NetPolicy, ResolvedNetPolicy};
 
 use serde::{Deserialize, Serialize};
 
+use crate::budget::Budget;
 use crate::error::Result;
 
 /// Everything a caller declares at sandbox creation.
-///
-/// `budget` joins in module M-4; until then the spec carries policies only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxSpec {
@@ -31,6 +30,8 @@ pub struct SandboxSpec {
     pub net: NetPolicy,
     #[serde(default)]
     pub exec: ExecPolicy,
+    #[serde(default)]
+    pub budget: Budget,
 }
 
 impl SandboxSpec {
@@ -39,6 +40,7 @@ impl SandboxSpec {
         let fs = self.fs.resolve()?;
         self.exec.validate()?;
         let net = self.net.resolve()?;
+        self.budget.validate()?;
         Ok((fs, net))
     }
 }
@@ -53,6 +55,19 @@ mod tests {
         let (fs, net) = spec.validate().unwrap();
         assert!(fs.readwrite.is_empty() && fs.readonly.is_empty() && fs.denied.is_empty());
         assert_eq!(net.egress_default, EgressDefault::Deny);
+    }
+
+    #[test]
+    fn budget_section_validates_with_the_spec() {
+        let json = r#"{"budget": {"memoryMb": 512, "pidsMax": 64}}"#;
+        let spec: SandboxSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.budget.memory_mb, 512);
+        assert_eq!(spec.budget.pids_max, 64);
+        spec.validate().unwrap();
+
+        let json = r#"{"budget": {"memoryMb": 0}}"#;
+        let spec: SandboxSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.validate().unwrap_err().code(), "budget_rejected");
     }
 
     #[test]
