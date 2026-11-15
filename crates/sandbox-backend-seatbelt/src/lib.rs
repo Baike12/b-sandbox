@@ -130,6 +130,11 @@ impl SandboxBackend for SeatbeltBackend {
                 kind: BackendFailureKind::Io,
                 message: format!("canonicalize rootfs {}: {e}", rootfs.display()),
             })?;
+        // A named template seeds the rootfs (reflink snapshot of a committed
+        // sandbox). Missing templates are policy errors, never empty rootfs.
+        if let Some(name) = &spec.template {
+            sandbox_core::materialize_template(&self.data_root, name, &rootfs)?;
+        }
         Ok(SandboxContext {
             id: id.to_string(),
             rootfs,

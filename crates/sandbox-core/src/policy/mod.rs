@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::Budget;
 use crate::error::Result;
+use crate::snapshot::validate_template_name;
 
 /// Everything a caller declares at sandbox creation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +33,11 @@ pub struct SandboxSpec {
     pub exec: ExecPolicy,
     #[serde(default)]
     pub budget: Budget,
+    /// Named rootfs template to materialize from (built by the commit
+    /// endpoint). None = empty scratch rootfs. Validated here as a name;
+    /// existence is the backend's concern (its data root holds templates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
 }
 
 impl SandboxSpec {
@@ -41,6 +47,9 @@ impl SandboxSpec {
         self.exec.validate()?;
         let net = self.net.resolve()?;
         self.budget.validate()?;
+        if let Some(name) = &self.template {
+            validate_template_name(name)?;
+        }
         Ok((fs, net))
     }
 }

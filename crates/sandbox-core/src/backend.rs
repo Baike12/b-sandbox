@@ -281,6 +281,7 @@ mod tests {
             net,
             exec,
             budget: Default::default(),
+            template: None,
         }
     }
 

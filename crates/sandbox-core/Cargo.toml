@@ -10,3 +10,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 ipnet = { workspace = true }
 async-trait = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

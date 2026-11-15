@@ -488,3 +488,43 @@ async fn traversal_cwd_is_rejected() {
     let err = backend.exec(&ctx, req).await.unwrap_err();
     assert_eq!(err.code(), "policy_validation");
 }
+
+#[tokio::test]
+async fn template_seeds_the_rootfs() {
+    let (backend, tmp) = fresh_backend().await;
+
+    // Build a template by hand (the commit endpoint does this via the API).
+    let tpl = tmp.path().join("templates").join("py-env");
+    std::fs::create_dir_all(tpl.join("lib")).unwrap();
+    std::fs::write(tpl.join("lib/seed.txt"), "seeded").unwrap();
+
+    let ctx = backend
+        .provision(
+            "from-template",
+            &SandboxSpec {
+                template: Some("py-env".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let outcome = backend
+        .exec(&ctx, exec_req("/bin/cat", &["lib/seed.txt"]))
+        .await
+        .unwrap();
+    assert_eq!(outcome.stdout, "seeded");
+    assert_eq!(outcome.exit_code, Some(0));
+
+    // An unknown template is a policy error, not an empty rootfs.
+    let err = backend
+        .provision(
+            "from-missing",
+            &SandboxSpec {
+                template: Some("missing-tpl".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "policy_validation");
+}

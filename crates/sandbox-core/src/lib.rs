@@ -11,6 +11,7 @@ pub mod error;
 pub mod events;
 pub mod lifecycle;
 pub mod policy;
+pub mod snapshot;
 
 pub use backend::{
     BackendCapabilities, BackendHealth, ExecOutcome, ExecRequest, SandboxBackend, SandboxContext,
@@ -20,3 +21,4 @@ pub use budget::Budget;
 pub use error::{BackendFailureKind, Error, Result};
 pub use events::{Event, EventKind, EventLog};
 pub use lifecycle::{Lifecycle, LifecycleState};
+pub use snapshot::{materialize_template, snapshot_tree, template_path, validate_template_name};
