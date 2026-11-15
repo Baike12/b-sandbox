@@ -1,0 +1,90 @@
+//! The policy model and the sandbox spec built from it.
+//!
+//! A [`SandboxSpec`] is the complete, validated declaration a caller submits
+//! when creating a sandbox. Rules of the model:
+//! - Serialization is the API contract: `deny_unknown_fields` everywhere
+//!   (hallucinated fields from agents are errors, not ignored), camelCase.
+//! - Validation happens once, here, at the domain boundary; backends receive
+//!   already-resolved policies plus their own capability checks.
+
+pub mod exec;
+pub mod fs;
+pub mod net;
+
+pub use exec::ExecPolicy;
+pub use fs::{FsAccess, FsPolicy, ResolvedFsPolicy};
+pub use net::{EgressDefault, NetPolicy, ResolvedNetPolicy};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::Result;
+
+/// Everything a caller declares at sandbox creation.
+///
+/// `budget` joins in module M-4; until then the spec carries policies only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxSpec {
+    #[serde(default)]
+    pub fs: FsPolicy,
+    #[serde(default)]
+    pub net: NetPolicy,
+    #[serde(default)]
+    pub exec: ExecPolicy,
+}
+
+impl SandboxSpec {
+    /// Validate all sections. Returns resolved policies on success.
+    pub fn validate(&self) -> Result<(ResolvedFsPolicy, ResolvedNetPolicy)> {
+        let fs = self.fs.resolve()?;
+        self.exec.validate()?;
+        let net = self.net.resolve()?;
+        Ok((fs, net))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_spec_validates_to_deny_all() {
+        let spec = SandboxSpec::default();
+        let (fs, net) = spec.validate().unwrap();
+        assert!(fs.readwrite.is_empty() && fs.readonly.is_empty() && fs.denied.is_empty());
+        assert_eq!(net.egress_default, EgressDefault::Deny);
+    }
+
+    #[test]
+    fn unknown_fields_are_hard_errors() {
+        // Agents hallucinate fields; a sandbox that ignores them would run with
+        // different semantics than the caller believes. This is fail-closed.
+        let json = r#"{"fs": {}, "net": {}, "exec": {}, "gpu": true}"#;
+        let err = serde_json::from_str::<SandboxSpec>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn snake_case_variant_of_camel_field_is_unknown() {
+        let json = r#"{"exec": {"max_output_bytes": 1024}}"#;
+        let err = serde_json::from_str::<SandboxSpec>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn camel_case_roundtrip() {
+        let json = r#"{"exec": {"maxOutputBytes": 4096, "maxOpenFiles": 64}}"#;
+        let spec: SandboxSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.exec.max_output_bytes, 4096);
+        assert_eq!(spec.exec.max_open_files, 64);
+        spec.validate().unwrap();
+    }
+
+    #[test]
+    fn invalid_section_fails_whole_spec() {
+        let json = r#"{"net": {"allow": [{"target": "10.0.0.0/8"}]}}"#;
+        let spec: SandboxSpec = serde_json::from_str(json).unwrap();
+        let err = spec.validate().unwrap_err();
+        assert_eq!(err.code(), "policy_validation");
+    }
+}

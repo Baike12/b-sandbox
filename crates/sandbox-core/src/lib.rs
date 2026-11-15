@@ -6,5 +6,6 @@
 //! implement the trait defined here.
 
 pub mod error;
+pub mod policy;
 
 pub use error::{BackendFailureKind, Error, Result};
