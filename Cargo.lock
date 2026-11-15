@@ -405,6 +405,7 @@ dependencies = [
  "sandbox-backend-bwrap",
  "sandbox-backend-seatbelt",
  "sandbox-core",
+ "sandbox-egress-proxy",
  "serde",
  "serde_json",
  "tempfile",
@@ -431,6 +432,7 @@ dependencies = [
  "async-trait",
  "libc",
  "sandbox-core",
+ "sandbox-egress-proxy",
  "tempfile",
  "tokio",
 ]
@@ -446,6 +448,22 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "sandbox-egress-proxy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "sandbox-sdk"
+version = "0.1.0"
+dependencies = [
+ "sandbox-core",
 ]
 
 [[package]]

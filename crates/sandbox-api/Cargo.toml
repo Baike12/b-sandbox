@@ -12,6 +12,7 @@ path = "src/main.rs"
 sandbox-core = { path = "../sandbox-core" }
 sandbox-backend-seatbelt = { path = "../sandbox-backend-seatbelt" }
 sandbox-backend-bwrap = { path = "../sandbox-backend-bwrap" }
+sandbox-egress-proxy = { path = "../sandbox-egress-proxy" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

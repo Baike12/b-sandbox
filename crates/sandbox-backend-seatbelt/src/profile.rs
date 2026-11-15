@@ -60,8 +60,16 @@ fn subpaths(paths: &[&str]) -> String {
         .join(" ")
 }
 
-/// Generate the Seatbelt scheme for one sandbox.
-pub fn generate(fs: &ResolvedFsPolicy, net: &ResolvedNetPolicy, rootfs: &Path) -> String {
+/// Generate the Seatbelt scheme for one sandbox. `egress_proxy` is the
+/// `ip:port` of the credential-injection proxy; it is required when the
+/// resolved policy is in proxy mode (validated at provision, before this
+/// function runs).
+pub fn generate(
+    fs: &ResolvedFsPolicy,
+    net: &ResolvedNetPolicy,
+    rootfs: &Path,
+    egress_proxy: Option<&str>,
+) -> String {
     let rootfs = rootfs.to_string_lossy();
     let mut scheme = String::with_capacity(4096);
 
@@ -133,14 +141,30 @@ pub fn generate(fs: &ResolvedFsPolicy, net: &ResolvedNetPolicy, rootfs: &Path) -
         scheme.push_str(&format!("(allow process-exec {})\n", exec_paths.join(" ")));
     }
 
-    // 6. Egress posture: all-or-nothing (capability NET_EGRESS_DEFAULT).
-    // `system-socket` is required on modern macOS for socket(2) under a
-    // deny-default profile (MXC reached the same wall); deny-all intentionally
-    // omits it so the workload cannot even create sockets.
-    match net.egress_default {
-        EgressDefault::Deny => scheme.push_str("(deny network-outbound)\n"),
-        EgressDefault::Allow => {
-            scheme.push_str("(allow network-outbound)\n(allow system-socket)\n")
+    // 6. Egress posture (capability NET_EGRESS_DEFAULT; proxy mode needs
+    // NET_EGRESS_PROXY). `system-socket` is required on modern macOS for
+    // socket(2) under a deny-default profile (MXC reached the same wall);
+    // deny-all intentionally omits it so the workload cannot even create
+    // sockets. Proxy mode: exactly one hole — the proxy endpoint — with
+    // credentials injected by the proxy, never visible to the workload.
+    if net.proxy {
+        // Seatbelt only accepts `*` or `localhost` as the network-filter host;
+        // the backend validates the proxy address is loopback, so the single
+        // hole is `localhost:<port>` (proven by the proxy-mode integration
+        // test: allowed target connects, everything else is denied).
+        let port = egress_proxy
+            .and_then(|a| a.rsplit_once(':').map(|(_, p)| p.to_string()))
+            .unwrap_or_else(|| "0".into());
+        scheme.push_str("(deny network-outbound)\n");
+        scheme.push_str(&format!(
+            "(allow network-outbound (to tcp \"localhost:{port}\"))\n(allow system-socket)\n"
+        ));
+    } else {
+        match net.egress_default {
+            EgressDefault::Deny => scheme.push_str("(deny network-outbound)\n"),
+            EgressDefault::Allow => {
+                scheme.push_str("(allow network-outbound)\n(allow system-socket)\n")
+            }
         }
     }
 
@@ -161,7 +185,7 @@ mod tests {
     use sandbox_core::policy::FsPolicy;
 
     fn fixture(fs: FsPolicy, net: ResolvedNetPolicy, rootfs: &str) -> String {
-        generate(&fs.resolve().unwrap(), &net, Path::new(rootfs))
+        generate(&fs.resolve().unwrap(), &net, Path::new(rootfs), None)
     }
 
     fn default_net() -> ResolvedNetPolicy {
@@ -247,6 +271,30 @@ mod tests {
         .unwrap();
         let allow_scheme = fixture(FsPolicy::default(), allow_net, "/tmp/r");
         assert!(allow_scheme.contains("(allow network-outbound)"));
+    }
+
+    #[test]
+    fn proxy_mode_opens_only_the_proxy_endpoint() {
+        let net = sandbox_core::policy::NetPolicy {
+            proxy: true,
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        let scheme = generate(
+            &FsPolicy::default().resolve().unwrap(),
+            &net,
+            Path::new("/tmp/r"),
+            Some("127.0.0.1:8095"),
+        );
+        assert!(scheme.contains("(deny network-outbound)\n"));
+        assert!(
+            scheme.contains("(allow network-outbound (to tcp \"localhost:8095\"))"),
+            "{scheme}"
+        );
+        assert!(scheme.contains("(allow system-socket)"));
+        // No blanket allow.
+        assert!(!scheme.contains("(allow network-outbound)\n"));
     }
 
     #[test]

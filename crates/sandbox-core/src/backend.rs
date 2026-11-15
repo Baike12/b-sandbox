@@ -45,6 +45,11 @@ impl BackendCapabilities {
     pub const BUDGET_PIDS: Self = Self(1 << 6);
     /// Can enforce the exec rlimits (file descriptors).
     pub const BUDGET_NOFILE: Self = Self(1 << 7);
+    /// Can route egress through the credential-injection proxy: opens exactly
+    /// one network hole (the proxy endpoint) and injects proxy env vars.
+    /// Requires a per-port network filter (Seatbelt `(to tcp ip:port)`); bwrap
+    /// cannot express it and must not declare this bit.
+    pub const NET_EGRESS_PROXY: Self = Self(1 << 8);
 
     pub const fn bits(self) -> u16 {
         self.0
@@ -83,6 +88,12 @@ pub fn check_policy_support(spec: &SandboxSpec, caps: BackendCapabilities) -> Re
     // the default bit. Deny targets that restate protected ranges are still
     // "rules" — a backend without rule support gets deny-all from its default
     // capability instead, and must reject the spec rather than ignore the list.
+    if spec.net.proxy && !caps.has(BackendCapabilities::NET_EGRESS_PROXY) {
+        return Err(Error::Policy(
+            "backend cannot route egress through the credential proxy (no NET_EGRESS_PROXY capability)"
+                .into(),
+        ));
+    }
     let has_net_rules = !spec.net.allow.is_empty() || !spec.net.deny.is_empty();
     if has_net_rules && !caps.has(BackendCapabilities::NET_EGRESS_RULES) {
         return Err(Error::Policy(
@@ -304,6 +315,7 @@ mod tests {
             BackendCapabilities::BUDGET_MEMORY,
             BackendCapabilities::BUDGET_PIDS,
             BackendCapabilities::BUDGET_NOFILE,
+            BackendCapabilities::NET_EGRESS_PROXY,
         ];
         let total: u16 = all.iter().map(|c| c.bits()).fold(0, |a, b| a | b);
         assert_eq!(
@@ -363,6 +375,7 @@ mod tests {
                     target: "203.0.113.0/24".into(),
                 }],
                 allow: vec![],
+                proxy: false,
             },
             ExecPolicy::default(),
         );
@@ -439,9 +452,29 @@ mod tests {
                 deny: vec![NetTarget {
                     target: "203.0.113.0/24".into(),
                 }],
+                proxy: false,
             },
             ExecPolicy::default(),
         );
+        check_policy_support(&spec, caps).unwrap();
+    }
+
+    #[test]
+    fn proxy_request_without_the_bit_is_rejected() {
+        let caps = BackendCapabilities::NET_EGRESS_DEFAULT.union(PIDS_TIER);
+        let spec = SandboxSpec {
+            net: NetPolicy {
+                proxy: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = check_policy_support(&spec, caps).unwrap_err();
+        assert_eq!(err.code(), "policy_validation");
+        assert!(err.to_string().contains("NET_EGRESS_PROXY"), "{err}");
+
+        // A backend declaring the bit accepts it.
+        let caps = caps.union(BackendCapabilities::NET_EGRESS_PROXY);
         check_policy_support(&spec, caps).unwrap();
     }
 

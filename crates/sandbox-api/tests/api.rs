@@ -1008,6 +1008,28 @@ async fn open_service_needs_no_token() {
     assert_eq!(status, StatusCode::CREATED);
 }
 
+#[tokio::test]
+async fn proxy_spec_without_capability_is_rejected() {
+    // The mock declares no NET_EGRESS_PROXY bit: proxy-mode specs must fail
+    // validation with policy_validation, not silently run direct egress.
+    let app = app(MockBackend::available());
+    let (status, body) = call(
+        app,
+        "POST",
+        "/sandboxes",
+        Some(json!({"net": {"proxy": true}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "policy_validation");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("NET_EGRESS_PROXY")
+    );
+}
+
 // ---------- macOS end-to-end with the real backend ----------
 
 #[cfg(target_os = "macos")]

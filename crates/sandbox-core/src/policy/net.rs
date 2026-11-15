@@ -146,6 +146,13 @@ pub struct NetPolicy {
     pub allow: Vec<NetTarget>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<NetTarget>,
+    /// Route all egress through the service's credential-injection proxy.
+    /// The workload never talks to the internet directly: the backend opens
+    /// exactly one hole — the proxy endpoint — and injects proxy env vars.
+    /// User allow/deny lists and an allow default are meaningless here and
+    /// rejected: credentials live in the proxy, not in the policy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proxy: bool,
 }
 
 /// Normalized egress policy.
@@ -156,6 +163,8 @@ pub struct ResolvedNetPolicy {
     pub deny: Vec<TargetKind>,
     /// Ranges that are always denied and can never be allowed.
     pub protected: Vec<IpNet>,
+    /// Proxy mode: direct egress is replaced by the single proxy hole.
+    pub proxy: bool,
 }
 
 /// Ranges no policy may open. Kept as one table so tests and enforcement agree.
@@ -217,6 +226,19 @@ impl NetPolicy {
             )?);
         }
 
+        // Proxy mode replaces direct egress entirely; mixing it with target
+        // lists would imply two enforcement paths for one sandbox.
+        if self.proxy
+            && (!self.allow.is_empty()
+                || !self.deny.is_empty()
+                || self.egress_default == EgressDefault::Allow)
+        {
+            return Err(Error::Policy(
+                "net.proxy replaces direct egress; allow/deny lists and an allow default are rejected under it"
+                    .into(),
+            ));
+        }
+
         // Allow-vs-deny overlap is legal (allow wins at enforcement); protected
         // overlap in `allow` is not. `deny` may restate protected ranges.
         Ok(ResolvedNetPolicy {
@@ -224,6 +246,7 @@ impl NetPolicy {
             allow,
             deny,
             protected,
+            proxy: self.proxy,
         })
     }
 }
@@ -251,6 +274,7 @@ mod tests {
     fn resolve(allow: &[&str], deny: &[&str], default: EgressDefault) -> Result<ResolvedNetPolicy> {
         NetPolicy {
             egress_default: default,
+            proxy: false,
             allow: allow
                 .iter()
                 .map(|t| NetTarget {
@@ -336,6 +360,7 @@ mod tests {
             EgressDefault::Deny,
         )
         .unwrap();
+        assert!(!resolved.proxy);
         assert!(resolved.deny.contains(&TargetKind::Cidr(
             IpNet::from_str("169.254.169.254/32").unwrap()
         )));
@@ -388,6 +413,35 @@ mod tests {
         let d = Domain::parse("example.com").unwrap();
         assert!(d.matches("example.com"));
         assert!(!d.matches("api.example.com"));
+    }
+
+    #[test]
+    fn proxy_mode_rejects_target_lists_and_allow_default() {
+        let policy = NetPolicy {
+            proxy: true,
+            allow: vec![NetTarget {
+                target: "example.com".into(),
+            }],
+            ..Default::default()
+        };
+        let err = policy.resolve().unwrap_err();
+        assert_eq!(err.code(), "policy_validation");
+
+        let policy = NetPolicy {
+            proxy: true,
+            egress_default: EgressDefault::Allow,
+            ..Default::default()
+        };
+        assert_eq!(policy.resolve().unwrap_err().code(), "policy_validation");
+
+        // Bare proxy mode with deny default is the valid form.
+        let resolved = NetPolicy {
+            proxy: true,
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        assert!(resolved.proxy);
     }
 
     #[test]

@@ -11,4 +11,5 @@ libc = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+sandbox-egress-proxy = { path = "../sandbox-egress-proxy" }
 tempfile = { workspace = true }

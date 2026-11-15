@@ -6,7 +6,10 @@
 #![cfg(target_os = "macos")]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use sandbox_backend_seatbelt::SeatbeltBackend;
 use sandbox_core::policy::{EgressDefault, FsPolicy, NetPolicy, NetTarget, SandboxSpec};
@@ -417,6 +420,7 @@ async fn egress_rules_are_rejected_not_degraded() {
                 target: "example.com".into(),
             }],
             deny: vec![],
+            proxy: false,
         },
         ..Default::default()
     };
@@ -527,4 +531,86 @@ async fn template_seeds_the_rootfs() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), "policy_validation");
+}
+
+/// Minimal upstream HTTP server that captures the request head and asserts
+/// the proxy injected the credential. Returns the bound port.
+async fn spawn_upstream(captured: Arc<std::sync::Mutex<String>>) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            let captured = captured.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let n = conn.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                *captured.lock().unwrap() = String::from_utf8_lossy(&buf).to_string();
+                conn.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nproxy-ok",
+                )
+                .await
+                .unwrap();
+            });
+        }
+    });
+    port
+}
+
+/// Enforcement evidence for NET_EGRESS_PROXY: the sandbox reaches the
+/// internet ONLY through the proxy; the credential arrives at the upstream
+/// injected, and direct egress to any other target is denied.
+#[tokio::test]
+async fn proxy_mode_egress_goes_through_the_credential_proxy() {
+    let captured = Arc::new(std::sync::Mutex::new(String::new()));
+    let upstream = spawn_upstream(captured.clone()).await;
+
+    let creds = Arc::new(std::collections::BTreeMap::from([(
+        "127.0.0.1".to_string(),
+        "Bearer tok-123".to_string(),
+    )]));
+    let proxy = sandbox_egress_proxy::spawn("127.0.0.1:0", creds)
+        .await
+        .unwrap();
+
+    let (backend, _tmp) = fresh_backend().await;
+    let backend = backend.with_egress_proxy(proxy.to_string());
+    let spec = SandboxSpec {
+        net: NetPolicy {
+            proxy: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let ctx = backend.provision("via-proxy", &spec).await.unwrap();
+
+    // The workload sees no credential anywhere; the upstream sees it.
+    let outcome = backend
+        .exec(
+            &ctx,
+            exec_req(
+                "/usr/bin/curl",
+                &["-s", &format!("http://127.0.0.1:{upstream}/")],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.exit_code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "proxy-ok");
+    let seen = captured.lock().unwrap().clone();
+    assert!(seen.contains("Authorization: Bearer tok-123\r\n"), "{seen}");
+
+    // Direct egress (proxy env cleared for this exec) to a non-proxy target
+    // is denied by the profile: curl fails fast with exit 7, no timeout.
+    let mut direct = exec_req("/usr/bin/curl", &["-s", "http://203.0.113.5/"]);
+    direct.env.insert("NO_PROXY".to_string(), "*".to_string());
+    direct.env.insert("no_proxy".to_string(), "*".to_string());
+    let denied = backend.exec(&ctx, direct).await.unwrap();
+    assert_ne!(denied.exit_code, Some(0));
+    assert!(!denied.timed_out);
+    assert!(!captured.lock().unwrap().contains("203.0.113.5"));
 }

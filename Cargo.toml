@@ -5,6 +5,8 @@ members = [
     "crates/sandbox-backend-seatbelt",
     "crates/sandbox-backend-bwrap",
     "crates/sandbox-api",
+    "crates/sandbox-egress-proxy",
+    "crates/sandbox-sdk",
 ]
 
 [workspace.package]
@@ -22,6 +24,7 @@ ipnet = "2"
 async-trait = "0.1"
 axum = "0.8"
 libc = "0.2"
+tokio-stream = { version = "0.1", default-features = false, features = ["time", "sync"] }
 tempfile = "3"
 
 [profile.release]

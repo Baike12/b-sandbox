@@ -41,13 +41,23 @@ use sandbox_core::{
 pub struct SeatbeltBackend {
     /// Directory under which sandbox rootfs directories are created.
     data_root: PathBuf,
+    /// `ip:port` of the credential-injection egress proxy, when the service
+    /// runs one. Proxy-mode specs are rejected at provision without it.
+    egress_proxy: Option<String>,
 }
 
 impl SeatbeltBackend {
     pub fn new(data_root: impl Into<PathBuf>) -> Self {
         Self {
             data_root: data_root.into(),
+            egress_proxy: None,
         }
+    }
+
+    /// Route proxy-mode sandboxes through the credential-injection proxy.
+    pub fn with_egress_proxy(mut self, addr: impl Into<String>) -> Self {
+        self.egress_proxy = Some(addr.into());
+        self
     }
 
     fn rootfs_for(&self, id: &str) -> Result<PathBuf> {
@@ -83,6 +93,9 @@ impl SandboxBackend for SeatbeltBackend {
             .union(BackendCapabilities::FS_READONLY)
             .union(BackendCapabilities::FS_DENIED)
             .union(BackendCapabilities::NET_EGRESS_DEFAULT)
+            // Per-port egress hole for the credential proxy (Seatbelt
+            // `(to tcp ip:port)`); proven by the proxy-mode integration test.
+            .union(BackendCapabilities::NET_EGRESS_PROXY)
             // macOS tier: pids + nofile only. Memory budgets are not
             // enforceable here (see BUDGET_MEMORY docs in sandbox-core).
             .union(BackendCapabilities::BUDGET_PIDS)
@@ -104,6 +117,18 @@ impl SandboxBackend for SeatbeltBackend {
         // Fail-closed belt-and-braces: never trust the caller's checks.
         let (fs, net) = spec.validate()?;
         sandbox_core::check_policy_support(spec, self.capabilities())?;
+        if spec.net.proxy {
+            // Seatbelt's network filter only accepts `*` or `localhost` as
+            // the host, so the single egress hole must be a loopback proxy.
+            match self.egress_proxy.as_deref() {
+                None => {
+                    return Err(Error::Policy(
+                        "net.proxy requested but this service runs no egress proxy".into(),
+                    ));
+                }
+                Some(addr) => macos_exec::validate_loopback_addr(addr)?,
+            }
+        }
         let rootfs = self.rootfs_for(id)?;
         tokio::fs::create_dir_all(&rootfs)
             .await
@@ -148,7 +173,7 @@ impl SandboxBackend for SeatbeltBackend {
         req.validate()?;
         #[cfg(target_os = "macos")]
         {
-            return macos_exec::exec(ctx, req).await;
+            return macos_exec::exec(ctx, req, self.egress_proxy.as_deref()).await;
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -273,6 +298,46 @@ mod macos_exec {
     /// policy path are allowed (or denied): the submitted form and the
     /// kernel-resolved form. If the two spellings end up in conflicting sets,
     /// the later rule wins (deny-last ordering keeps that fail-closed).
+    /// Validate `ip:port` is a loopback endpoint (Seatbelt network filters only
+    /// permit `*` or `localhost`; anything else would silently become localhost).
+    pub(super) fn validate_loopback_addr(addr: &str) -> Result<()> {
+        let err = || {
+            Error::Policy(format!(
+                "egress proxy address {addr:?} invalid: must be 127.0.0.1:PORT or [::1]:PORT on the loopback"
+            ))
+        };
+        let (ip_raw, port_raw) = addr.rsplit_once(':').ok_or_else(err)?;
+        let ip_raw = ip_raw.trim_start_matches('[').trim_end_matches(']');
+        let ip: std::net::IpAddr = ip_raw.parse().map_err(|_| err())?;
+        if !ip.is_loopback() {
+            return Err(err());
+        }
+        let port: u16 = port_raw.parse().map_err(|_| err())?;
+        if port == 0 {
+            return Err(err());
+        }
+        Ok(())
+    }
+
+    /// Proxy-mode execs get standard proxy env vars pointing at the service's
+    /// credential-injection proxy. Empty NO_PROXY: nothing bypasses the proxy.
+    fn proxy_env(ctx: &SandboxContext, egress_proxy: Option<&str>) -> Vec<(String, String)> {
+        if !ctx.net.proxy {
+            return Vec::new();
+        }
+        match egress_proxy {
+            None => Vec::new(), // unreachable: provision rejects proxy mode without one
+            Some(addr) => {
+                let url = format!("http://{addr}");
+                ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+                    .iter()
+                    .map(|k| (k.to_string(), url.clone()))
+                    .chain([("NO_PROXY".to_string(), String::new())])
+                    .collect()
+            }
+        }
+    }
+
     fn resolve_policy_paths(fs: &ResolvedFsPolicy) -> ResolvedFsPolicy {
         fn resolve_set(set: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
             let mut out = BTreeSet::new();
@@ -291,7 +356,11 @@ mod macos_exec {
         }
     }
 
-    pub(super) async fn exec(ctx: &SandboxContext, req: ExecRequest) -> Result<ExecOutcome> {
+    pub(super) async fn exec(
+        ctx: &SandboxContext,
+        req: ExecRequest,
+        egress_proxy: Option<&str>,
+    ) -> Result<ExecOutcome> {
         // Working directory: sandbox-relative, must exist.
         let rel = normalize_relative(&req.cwd)?;
         let cwd = if rel.as_os_str().is_empty() {
@@ -306,7 +375,12 @@ mod macos_exec {
             )));
         }
 
-        let scheme = profile::generate(&resolve_policy_paths(&ctx.fs), &ctx.net, &ctx.rootfs);
+        let scheme = profile::generate(
+            &resolve_policy_paths(&ctx.fs),
+            &ctx.net,
+            &ctx.rootfs,
+            egress_proxy,
+        );
         if std::env::var_os("SANDBOX_DEBUG_PROFILE").is_some() {
             eprintln!("---- generated scheme ----\n{scheme}---- end scheme ----");
         }
@@ -326,6 +400,7 @@ mod macos_exec {
                 ("HOME", home.as_str()),
                 ("TMPDIR", tmpdir.as_str()),
             ])
+            .envs(proxy_env(ctx, egress_proxy))
             .envs(req.env.iter())
             .current_dir(&cwd)
             .stdin(std::process::Stdio::null())
