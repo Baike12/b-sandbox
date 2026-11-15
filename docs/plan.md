@@ -100,3 +100,18 @@ This document details M1 only; later milestones get their own plan docs when M1 
 ## 5. Out of scope for M1 (explicitly)
 
 TTL/pause, snapshots, templates beyond `scratch`, SSE, OpenAPI generation, SDK crates, Docker/OCI backend, libkrun, credential injection, multi-node anything.
+
+## 6. M2 module plan (production hardening)
+
+Same loop as M1: implement → tests → `scripts/gate.sh` → commit. One commit per module.
+
+| Module | Ships | Done when |
+| --- | --- | --- |
+| **P-1 deploy skeleton** | `deploy/Dockerfile`, `deploy/compose.yaml`, `scripts/deploy.sh` + `remote_run.sh` + `server_setup.sh` mirroring ../b-superagent (cross-compile → scp → server-side docker build → compose up → curl verify) | `bash scripts/deploy.sh --host …` runs end-to-end on the volcano server; `/health` reports the honest tier inside the container |
+| **P-2 budget ledger** | Per-sandbox usage accounting (exec count, output bytes, wall time, created/last-activity) updated at each lifecycle/exec/file touchpoint; exposed in `GET /sandboxes/{id}` | Tests prove every accounting field moves exactly when its cause happens; totals survive a full create→exec→files→delete cycle |
+| **P-3 idle TTL + pause** | `timeoutMs` accepted at create (E2B-aligned); lifecycle gains `Paused`; background reaper pauses then terminates idle/expired sandboxes, emitting events | Tests prove an idle sandbox reaches `paused`/`terminated` with the right event sequence and TTL refresh on activity; pause of a Terminated sandbox is a conflict |
+| **P-4 Prometheus metrics** | `GET /metrics` in Prometheus text format, hand-rolled (no dependency): sandboxes created/active/terminated, execs (total/timeout/truncated), output bytes | Metric values move in lockstep with the ledger and lifecycle under the same tests |
+| **P-5 OpenAPI + contract tests** | `docs/openapi.yaml` (hand-written, versioned) + a contract test that asserts every registered route exists in the spec with matching error codes | Route/spec drift fails the gate |
+| **P-6 perf gate** | Startup latency and exec round-trip gate tests, calibrated from measured baselines, order-of-magnitude bounds | Gate tests run in CI without flaking |
+
+Recorded but deferred further: cgroups-v2 memory enforcement for bwrap (needs Linux host evidence; capability bit stays undeclared until a test proves enforcement), e2b SDK driver over the API (envd-protocol bridge belongs with the M3 microVM in-guest agent), SSE streaming, Rust client SDK.
