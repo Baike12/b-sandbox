@@ -28,6 +28,9 @@ pub struct AppState {
     pub data_root: std::path::PathBuf,
     /// Service-level counters (lock-free atomics; scrape derives gauges).
     pub metrics: crate::metrics::Metrics,
+    /// Shared bearer token. None = open service (localhost + nginx posture);
+    /// Some = every route except /health requires `Authorization: Bearer …`.
+    pub auth_token: Option<String>,
 }
 
 pub struct SandboxRecord {
@@ -61,7 +64,14 @@ impl AppState {
             idempotency: RwLock::new(HashMap::new()),
             data_root,
             metrics: Default::default(),
+            auth_token: None,
         }
+    }
+
+    /// Require a bearer token on every route except /health.
+    pub fn with_auth_token(mut self, token: Option<String>) -> Self {
+        self.auth_token = token;
+        self
     }
 
     /// Clone the record handle out of the registry (releasing the registry

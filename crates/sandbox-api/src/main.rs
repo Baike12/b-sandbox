@@ -24,6 +24,7 @@ struct Config {
     port: u16,
     bind: IpAddr,
     backend: String,
+    auth_token: Option<String>,
 }
 
 fn parse_args() -> Config {
@@ -32,6 +33,7 @@ fn parse_args() -> Config {
         port: 8094,
         bind: IpAddr::from([127, 0, 0, 1]),
         backend: "seatbelt".into(),
+        auth_token: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -57,10 +59,18 @@ fn parse_args() -> Config {
                     .expect("--bind must be an IP address")
             }
             "--backend" => cfg.backend = args.next().expect("--backend needs a value"),
+            "--auth-token" => {
+                cfg.auth_token = Some(args.next().expect("--auth-token needs a value"))
+            }
             other => {
                 panic!("unknown argument {other:?} (expected --data-root/--port/--bind/--backend)")
             }
         }
+    }
+    // The token flows through the environment in production (argv is visible
+    // in `ps`); the flag exists for local experiments.
+    if cfg.auth_token.is_none() {
+        cfg.auth_token = std::env::var("B_SANDBOX_AUTH_TOKEN").ok();
     }
     cfg
 }
@@ -97,10 +107,10 @@ fn main() {
         cfg.port
     );
 
-    let state = Arc::new(sandbox_api::state::AppState::new(
-        backend,
-        cfg.data_root.clone(),
-    ));
+    let state = Arc::new(
+        sandbox_api::state::AppState::new(backend, cfg.data_root.clone())
+            .with_auth_token(cfg.auth_token),
+    );
     // Idle-TTL reaper: terminates sandboxes whose declared TTL elapsed.
     sandbox_api::reaper::spawn(state.clone());
     let runtime = tokio::runtime::Builder::new_multi_thread()

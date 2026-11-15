@@ -61,6 +61,16 @@ pub fn sandbox_not_found(id: &str) -> ApiError {
     }
 }
 
+/// A 401 for a missing/invalid bearer token (token auth only when
+/// configured; localhost + nginx deployments may run open).
+pub fn unauthorized() -> ApiError {
+    ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        code: "unauthorized",
+        message: "missing or invalid bearer token".into(),
+    }
+}
+
 /// A 503 when the selected backend is not available on this host. There is
 /// never a fallback to a weaker isolation tier.
 pub fn backend_unavailable(reason: &str) -> ApiError {

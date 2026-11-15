@@ -936,6 +936,78 @@ async fn sse_stream_replays_and_pushes_live_events() {
     assert!(seen.contains("\"command\""), "data payload is JSON: {seen}");
 }
 
+// ---------- auth ----------
+
+/// Router with a token configured (state built directly).
+fn app_with_token(token: &str) -> axum::Router {
+    let backend = MockBackend::available_in(std::env::temp_dir());
+    let tmp = tempfile::tempdir().unwrap();
+    let data_root = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let state = Arc::new(
+        AppState::new(Arc::new(backend), data_root).with_auth_token(Some(token.to_string())),
+    );
+    router(state)
+}
+
+#[tokio::test]
+async fn token_auth_gates_everything_but_health() {
+    let app = app_with_token("sekrit-token");
+
+    // Health stays open (deployment probes must not need secrets).
+    let (status, _) = call(app.clone(), "GET", "/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // No token / wrong token → 401 with the error envelope.
+    for auth in [
+        None,
+        Some("Bearer wrong"),
+        Some("Basic abc"),
+        Some("sekrit-token"),
+    ] {
+        let mut req = Request::builder().method("GET").uri("/sandboxes");
+        if let Some(value) = auth {
+            req = req.header("authorization", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        if auth == Some("Bearer sekrit-token") {
+            assert_eq!(response.status(), StatusCode::OK);
+        } else {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"], "unauthorized");
+        }
+    }
+
+    // A valid token passes through to normal behavior.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sandboxes")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sekrit-token")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn open_service_needs_no_token() {
+    let app = app(MockBackend::available());
+    let (status, _) = call(app, "POST", "/sandboxes", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
 // ---------- macOS end-to-end with the real backend ----------
 
 #[cfg(target_os = "macos")]

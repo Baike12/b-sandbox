@@ -51,6 +51,8 @@ pub fn route_table() -> Vec<RouteEntry> {
 
 pub fn router(state: SharedState) -> Router {
     let table = route_table();
+    // Token auth wraps every route; the middleware itself opens /health.
+
     // Same-path entries with different methods fold into one MethodRouter —
     // axum rejects duplicate registrations of the same path.
     let paths: std::collections::BTreeSet<&'static str> =
@@ -68,7 +70,63 @@ pub fn router(state: SharedState) -> Router {
         }
         router = router.route(path, merged);
     }
-    router.with_state(state)
+    router
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .with_state(state)
+}
+
+/// Bearer-token gate. Open when no token is configured; `/health` stays
+/// open either way (the deployment probe must not need secrets). Token
+/// comparison is constant-time.
+async fn auth_middleware(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    if req.uri().path() == "/health" || state.auth_token.is_none() {
+        return Ok(next.run(req).await);
+    }
+    let ok = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|given| {
+            ct_eq(
+                given.as_bytes(),
+                state.auth_token.as_deref().unwrap_or("").as_bytes(),
+            )
+        });
+    if ok {
+        Ok(next.run(req).await)
+    } else {
+        Err(crate::error::unauthorized())
+    }
+}
+
+/// Constant-time byte equality (no early exit on the secret).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ct_eq;
+
+    #[test]
+    fn constant_time_equality_matches_only_equal_slices() {
+        assert!(ct_eq(b"tok-1", b"tok-1"));
+        assert!(!ct_eq(b"tok-1", b"tok-2"));
+        assert!(!ct_eq(b"tok-1", b"tok-12"));
+        assert!(!ct_eq(b"", b"a"));
+        assert!(ct_eq(b"", b""));
+    }
 }
 
 // ---------- health ----------
