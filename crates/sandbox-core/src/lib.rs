@@ -19,4 +19,4 @@ pub use backend::{
 pub use budget::Budget;
 pub use error::{BackendFailureKind, Error, Result};
 pub use events::{Event, EventKind, EventLog};
-pub use lifecycle::LifecycleState;
+pub use lifecycle::{Lifecycle, LifecycleState};

@@ -10,7 +10,15 @@ path = "src/main.rs"
 
 [dependencies]
 sandbox-core = { path = "../sandbox-core" }
+sandbox-backend-seatbelt = { path = "../sandbox-backend-seatbelt" }
+sandbox-backend-bwrap = { path = "../sandbox-backend-bwrap" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+async-trait = { workspace = true }
