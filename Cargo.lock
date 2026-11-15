@@ -404,7 +404,11 @@ dependencies = [
 name = "sandbox-backend-bwrap"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "libc",
  "sandbox-core",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
