@@ -1,0 +1,20 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / web
+node_modules/
+dist/
+
+# Local runtime data (workload scratch space)
+/data
+.env
+
+# Logs & OS noise
+*.log
+.DS_Store
+
+# Vendored reference projects: local clones only, upstream stays on GitHub.
+# Provenance is tracked in vendor/README.md instead.
+/vendor/*
+!vendor/README.md
