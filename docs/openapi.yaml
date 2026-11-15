@@ -370,6 +370,27 @@ paths:
               schema: { $ref: "#/components/schemas/EventsResponse" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /sandboxes/{id}/events/stream:
+    get:
+      tags: [observability]
+      summary: Live event tail as Server-Sent Events
+      description: |
+        Replays events after `?after=` or the `Last-Event-ID` header, then
+        follows the log. Each event carries the monotonic `seq` as the SSE id,
+        the kind as the event name, and the payload as JSON data.
+      parameters:
+        - { $ref: "#/components/parameters/SandboxId" }
+        - in: query
+          name: after
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Event stream (text/event-stream)
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /metrics:
     get:
       tags: [observability]

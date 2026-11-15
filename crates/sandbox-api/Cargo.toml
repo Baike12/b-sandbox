@@ -14,6 +14,7 @@ sandbox-backend-seatbelt = { path = "../sandbox-backend-seatbelt" }
 sandbox-backend-bwrap = { path = "../sandbox-backend-bwrap" }
 axum = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

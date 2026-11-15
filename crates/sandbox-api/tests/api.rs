@@ -865,6 +865,77 @@ async fn commit_then_create_from_template_round_trips() {
     assert_eq!(body["error"]["code"], "policy_validation");
 }
 
+// ---------- SSE event stream ----------
+
+#[tokio::test]
+async fn sse_stream_replays_and_pushes_live_events() {
+    let app = app(MockBackend::available());
+    let (app, id) = create_sandbox(app).await;
+
+    // Open the stream first, then exec concurrently: the stream must push
+    // exec events as they happen (this is the "live" part of the contract).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/sandboxes/{id}/events/stream?after=0"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let exec_app = app.clone();
+    let exec_id = id.clone();
+    let exec_task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        call(
+            exec_app,
+            "POST",
+            &format!("/sandboxes/{exec_id}/exec"),
+            Some(json!({"command": "echo"})),
+        )
+        .await
+    });
+
+    let mut body = response.into_body();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut seen = String::new();
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stream did not reach exec_finished in time: {seen}"
+        );
+        match tokio::time::timeout(std::time::Duration::from_millis(1500), body.frame()).await {
+            Err(_) => panic!("timed out waiting for body frame: {seen}"),
+            Ok(None) => panic!("stream ended early: {seen}"),
+            Ok(Some(Err(e))) => panic!("body error: {e}"),
+            Ok(Some(Ok(frame))) => {
+                let bytes = frame.into_data().unwrap_or_default();
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        if seen.contains("event: exec_finished") {
+            break;
+        }
+    }
+    exec_task.await.unwrap();
+    assert!(seen.contains("event: sandbox_created"), "{seen}");
+    assert!(seen.contains("event: exec_started"), "{seen}");
+    assert!(seen.contains("id: 2"), "{seen}");
+    assert!(seen.contains("id: 3"), "{seen}");
+    assert!(seen.contains("\"command\""), "data payload is JSON: {seen}");
+}
+
 // ---------- macOS end-to-end with the real backend ----------
 
 #[cfg(target_os = "macos")]

@@ -44,6 +44,7 @@ pub fn route_table() -> Vec<RouteEntry> {
         ("POST", "/sandboxes/{id}/files/mkdir", post(file_mkdir)),
         ("POST", "/sandboxes/{id}/files/remove", post(file_remove)),
         ("GET", "/sandboxes/{id}/events", get(events)),
+        ("GET", "/sandboxes/{id}/events/stream", get(events_stream)),
         ("GET", "/metrics", get(metrics)),
     ]
 }
@@ -687,6 +688,73 @@ async fn events(
         "lastSeq": events_log.last_seq(),
         "dropped": events_log.dropped(),
     })))
+}
+
+// ---------- event stream (SSE) ----------
+
+/// The SSE response type: channel stream wrapped by the keep-alive stream.
+pub type EventSse = axum::response::Sse<
+    axum::response::sse::KeepAliveStream<
+        tokio_stream::wrappers::ReceiverStream<
+            Result<axum::response::sse::Event, std::convert::Infallible>,
+        >,
+    >,
+>;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventsStreamQuery {
+    #[serde(default)]
+    after: Option<u64>,
+}
+
+/// Live tail of the sandbox event stream as Server-Sent Events. Replay
+/// starts after `?after=` or the `Last-Event-ID` header (SSE reconnect
+/// semantics), then follows the log. The per-sandbox log is the single
+/// source; the tail task reads it on a short tick — no second event state.
+async fn events_stream(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<EventsStreamQuery>,
+) -> ApiResult<EventSse> {
+    use axum::response::sse::{Event as SseEvent, KeepAlive};
+
+    let record = state.get(&id).ok_or_else(|| sandbox_not_found(&id))?;
+    let reconnect_cursor = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut cursor = reconnect_cursor.or(query.after).unwrap_or(0);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+        loop {
+            ticker.tick().await;
+            let pending = { record.events.lock().unwrap().events_after(cursor) };
+            for event in pending {
+                cursor = event.seq;
+                let kind = serde_json::to_string(&event.kind)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string();
+                let item = SseEvent::default()
+                    .id(event.seq.to_string())
+                    .event(kind)
+                    .data(event.data.to_string());
+                if tx.send(Ok(item)).await.is_err() {
+                    // The client disconnected; the record drops with this task.
+                    return;
+                }
+            }
+        }
+    });
+
+    Ok(
+        axum::response::Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .keep_alive(KeepAlive::default()),
+    )
 }
 
 fn io_error(e: std::io::Error, path: &std::path::Path) -> ApiError {
