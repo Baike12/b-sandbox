@@ -1,14 +1,14 @@
 //! Sandbox lifecycle state machine.
 //!
-//! M1 states: `Provisioning → Running → Terminated`. Paused/Pausing arrive in
-//! M2; the machine is a transition *table* so adding states extends the table
-//! instead of reworking conditionals.
+//! States: `Provisioning → Running ⇄ Paused → Terminated`. The machine is a
+//! transition *table*: adding states extends the table instead of reworking
+//! conditionals.
 //!
 //! Contract:
 //! - Transitions not in the table are `Error::Lifecycle` (code
 //!   `invalid_transition`), never silently coerced.
 //! - `Terminated` is terminal: no transition out of it exists.
-//! - Exec is legal only in `Running`.
+//! - Exec is legal only in `Running` — a paused sandbox serves no data plane.
 
 use crate::error::{Error, Result};
 
@@ -18,6 +18,9 @@ pub enum LifecycleState {
     Provisioning,
     /// Sandbox accepts execs and file operations.
     Running,
+    /// Environment is preserved but the data plane is closed; resume returns
+    /// it to `Running`. Resources are still held while paused.
+    Paused,
     /// Sandbox is destroyed. Terminal.
     Terminated,
 }
@@ -28,6 +31,7 @@ impl LifecycleState {
         match self {
             Self::Provisioning => "provisioning",
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Terminated => "terminated",
         }
     }
@@ -37,7 +41,10 @@ impl LifecycleState {
 const TRANSITIONS: &[(LifecycleState, LifecycleState)] = &[
     (LifecycleState::Provisioning, LifecycleState::Running),
     (LifecycleState::Provisioning, LifecycleState::Terminated),
+    (LifecycleState::Running, LifecycleState::Paused),
     (LifecycleState::Running, LifecycleState::Terminated),
+    (LifecycleState::Paused, LifecycleState::Running),
+    (LifecycleState::Paused, LifecycleState::Terminated),
 ];
 
 /// Whether `from -> to` is a legal transition.
@@ -154,9 +161,38 @@ mod tests {
     }
 
     #[test]
+    fn pause_resume_round_trip() {
+        let mut lc = Lifecycle::new();
+        lc.transition(LifecycleState::Running).unwrap();
+        lc.transition(LifecycleState::Paused).unwrap();
+        assert_eq!(lc.state(), LifecycleState::Paused);
+        assert!(!lc.can_exec(), "a paused sandbox serves no data plane");
+        lc.transition(LifecycleState::Running).unwrap();
+        assert!(lc.can_exec());
+    }
+
+    #[test]
+    fn paused_terminates_but_does_not_rewind() {
+        let mut lc = Lifecycle::new();
+        lc.transition(LifecycleState::Running).unwrap();
+        lc.transition(LifecycleState::Paused).unwrap();
+        lc.transition(LifecycleState::Terminated).unwrap();
+        assert_eq!(lc.state(), LifecycleState::Terminated);
+    }
+
+    #[test]
+    fn provisioning_cannot_skip_to_paused() {
+        let mut lc = Lifecycle::new();
+        let err = lc.transition(LifecycleState::Paused).unwrap_err();
+        assert_eq!(err.code(), "invalid_transition");
+        assert_eq!(lc.state(), LifecycleState::Provisioning);
+    }
+
+    #[test]
     fn state_names_are_the_wire_contract() {
         assert_eq!(LifecycleState::Provisioning.as_str(), "provisioning");
         assert_eq!(LifecycleState::Running.as_str(), "running");
+        assert_eq!(LifecycleState::Paused.as_str(), "paused");
         assert_eq!(LifecycleState::Terminated.as_str(), "terminated");
     }
 }

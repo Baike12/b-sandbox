@@ -101,6 +101,8 @@ fn main() {
         backend,
         cfg.data_root.clone(),
     ));
+    // Idle-TTL reaper: terminates sandboxes whose declared TTL elapsed.
+    sandbox_api::reaper::spawn(state.clone());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

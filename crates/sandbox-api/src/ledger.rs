@@ -45,6 +45,17 @@ impl UsageLedger {
         self.last_activity_ms = now_ms;
     }
 
+    /// Refresh the idle marker without counting an operation. Used for
+    /// lifecycle actions (resume) that reopen the data plane.
+    pub fn refresh_activity(&mut self, now_ms: u64) {
+        self.touch(now_ms);
+    }
+
+    /// Idle marker read by the TTL reaper.
+    pub fn last_activity_ms(&self) -> u64 {
+        self.last_activity_ms
+    }
+
     pub fn record_exec_started(&mut self, now_ms: u64) {
         self.touch(now_ms);
         self.execs_started += 1;

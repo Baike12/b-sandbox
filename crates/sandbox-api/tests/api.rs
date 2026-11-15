@@ -115,12 +115,19 @@ impl SandboxBackend for MockBackend {
 }
 
 fn app(backend: MockBackend) -> axum::Router {
+    app_with_state(backend).0
+}
+
+/// Router plus the state handle, for tests that drive service internals
+/// (the reaper sweep) directly.
+fn app_with_state(backend: MockBackend) -> (axum::Router, Arc<AppState>) {
     let tmp = tempfile::tempdir().unwrap();
     let data_root = tmp.path().to_path_buf();
     // The router owns the state; leak the tempdir so data outlives the test
     // (tests are short-lived; this keeps the helper signature simple).
     std::mem::forget(tmp);
-    router(Arc::new(AppState::new(Arc::new(backend), data_root)))
+    let state = Arc::new(AppState::new(Arc::new(backend), data_root));
+    (router(state.clone()), state)
 }
 
 async fn call(
@@ -573,6 +580,122 @@ async fn usage_ledger_tracks_a_full_cycle() {
     assert_eq!(usage["fileOps"], 2);
     assert!(usage["createdAtMs"].as_u64().unwrap() > 0);
     assert!(usage["lastActivityMs"].as_u64().unwrap() >= usage["createdAtMs"].as_u64().unwrap());
+}
+
+// ---------- pause / resume / idle TTL ----------
+
+#[tokio::test]
+async fn pause_resume_round_trip_and_conflicts() {
+    let app = app(MockBackend::available());
+    let (app, id) = create_sandbox(app).await;
+
+    let (status, _) = call(app.clone(), "POST", &format!("/sandboxes/{id}/pause"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = call(app.clone(), "GET", &format!("/sandboxes/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "paused");
+
+    // The data plane is closed while paused.
+    let (status, body) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/exec"),
+        Some(json!({"command": "echo"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "invalid_transition");
+
+    // Pausing a paused sandbox is a conflict, not a no-op.
+    let (status, _) = call(app.clone(), "POST", &format!("/sandboxes/{id}/pause"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, _) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/resume"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = call(app.clone(), "GET", &format!("/sandboxes/{id}"), None).await;
+    assert_eq!(body["state"], "running");
+
+    // Resuming a running sandbox is a conflict, not a no-op.
+    let (status, _) = call(app, "POST", &format!("/sandboxes/{id}/resume"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn reaper_terminates_expired_idle_sandboxes() {
+    let (app, state) = app_with_state(MockBackend::available());
+
+    // A short-TTL sandbox, a long-TTL sandbox, and one without a TTL.
+    let short = create_with_body(&app, json!({"timeoutMs": 50})).await;
+    let long = create_with_body(&app, json!({"timeoutMs": 604800000})).await;
+    let none = create_sandbox(app.clone()).await.1;
+
+    // Backdate the short-TTL sandbox's idle marker past its TTL.
+    state
+        .get(&short)
+        .unwrap()
+        .usage
+        .lock()
+        .unwrap()
+        .refresh_activity(0);
+
+    let swept = sandbox_api::reaper::sweep(&state).await;
+    assert_eq!(swept, 1);
+    assert!(state.get(&short).is_none());
+    assert!(state.get(&long).is_some());
+    assert!(state.get(&none).is_some());
+
+    let (status, body) = call(app, "GET", &format!("/sandboxes/{short}"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "sandbox_not_found");
+}
+
+#[tokio::test]
+async fn paused_sandboxes_still_expire() {
+    let (app, state) = app_with_state(MockBackend::available());
+    let id = create_with_body(&app, json!({"timeoutMs": 50})).await;
+    call(app.clone(), "POST", &format!("/sandboxes/{id}/pause"), None).await;
+
+    state
+        .get(&id)
+        .unwrap()
+        .usage
+        .lock()
+        .unwrap()
+        .refresh_activity(0);
+    // Pausing does not refresh the idle clock: the sandbox still holds
+    // resources, so the reaper still claims it.
+    assert_eq!(sandbox_api::reaper::sweep(&state).await, 1);
+    assert!(state.get(&id).is_none());
+}
+
+#[tokio::test]
+async fn timeout_validation_rejects_zero_and_over_ceiling() {
+    let app = app(MockBackend::available());
+    for ms in [0u64, 7 * 24 * 60 * 60 * 1000 + 1] {
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/sandboxes",
+            Some(json!({"timeoutMs": ms})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "timeoutMs={ms}");
+        assert_eq!(body["error"]["code"], "policy_validation");
+    }
+}
+
+/// Create a sandbox and return its id, asserting success.
+async fn create_with_body(app: &axum::Router, body: Value) -> String {
+    let (status, body) = call(app.clone(), "POST", "/sandboxes", Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["id"].as_str().unwrap().to_string()
 }
 
 // ---------- macOS end-to-end with the real backend ----------

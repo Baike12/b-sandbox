@@ -31,6 +31,8 @@ pub struct Event {
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     SandboxCreated,
+    SandboxPaused,
+    SandboxResumed,
     ExecStarted,
     ExecFinished,
     ExecTimedOut,
@@ -175,5 +177,18 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"kind\":\"sandbox_killed\""), "{json}");
         assert!(json.contains("\"tsMs\""), "{json}");
+    }
+
+    #[test]
+    fn pause_events_serialize_snake_case() {
+        let mut log = log();
+        for (kind, name) in [
+            (EventKind::SandboxPaused, "sandbox_paused"),
+            (EventKind::SandboxResumed, "sandbox_resumed"),
+        ] {
+            let event = log.push(kind, serde_json::json!({}));
+            let json = serde_json::to_string(&event).unwrap();
+            assert!(json.contains(&format!("\"kind\":\"{name}\"")), "{json}");
+        }
     }
 }

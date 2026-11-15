@@ -34,15 +34,19 @@ pub struct SandboxRecord {
     pub events: Mutex<EventLog>,
     /// Accounting side of the budget: what happened through the API.
     pub usage: Mutex<UsageLedger>,
+    /// Idle TTL in milliseconds; the reaper terminates the sandbox after
+    /// this much time without data-plane activity. `None` = no TTL.
+    pub ttl_ms: Option<u64>,
 }
 
 impl SandboxRecord {
-    pub fn new(ctx: SandboxContext) -> Self {
+    pub fn new(ctx: SandboxContext, ttl_ms: Option<u64>) -> Self {
         Self {
             ctx,
             lifecycle: Mutex::new(Lifecycle::new()),
             events: Mutex::new(EventLog::new()),
             usage: Mutex::new(UsageLedger::new(now_ms())),
+            ttl_ms,
         }
     }
 }

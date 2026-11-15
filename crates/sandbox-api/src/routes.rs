@@ -24,6 +24,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/health", get(health))
         .route("/sandboxes", post(create_sandbox).get(list_sandboxes))
         .route("/sandboxes/{id}", get(get_sandbox).delete(delete_sandbox))
+        .route("/sandboxes/{id}/pause", post(pause_sandbox))
+        .route("/sandboxes/{id}/resume", post(resume_sandbox))
         .route("/sandboxes/{id}/exec", post(exec))
         .route("/sandboxes/{id}/files/read", post(file_read))
         .route("/sandboxes/{id}/files/write", post(file_write))
@@ -68,13 +70,68 @@ fn view_of(record: &SandboxRecord) -> SandboxView {
     }
 }
 
+/// Parsed creation body: the sandbox spec (the request object itself) plus
+/// the service-level idle TTL extracted from it.
+#[derive(Debug)]
+struct CreateBody {
+    spec: sandbox_core::policy::SandboxSpec,
+    /// Idle TTL in ms: the reaper terminates the sandbox after this long
+    /// without data-plane activity. Absent = no TTL.
+    timeout_ms: Option<u64>,
+}
+
+/// Parse the create body. The wire object IS the spec; `timeoutMs` is the
+/// one envelope field on top. Deliberately parsed via `from_value` instead
+/// of serde flatten: flatten silently disables `deny_unknown_fields`, which
+/// would reopen the unknown-field hole the spec exists to close.
+fn parse_create_body(value: serde_json::Value) -> ApiResult<CreateBody> {
+    let policy = |msg: String| ApiError::from(Error::Policy(msg));
+    let mut map = match value {
+        serde_json::Value::Object(map) => map,
+        other => {
+            return Err(policy(format!(
+                "create body must be a JSON object, got {other}"
+            )));
+        }
+    };
+    let timeout_ms = match map.remove("timeoutMs") {
+        None => None,
+        Some(raw) => serde_json::from_value::<Option<u64>>(raw)
+            .map_err(|e| policy(format!("timeout_ms: {e}")))?,
+    };
+    let spec = serde_json::from_value::<sandbox_core::policy::SandboxSpec>(map.into())
+        .map_err(|e| policy(e.to_string()))?;
+    Ok(CreateBody { spec, timeout_ms })
+}
+
+/// One week: long enough for any legitimate session, short enough that a
+/// misconfigured TTL cannot accumulate zombies forever.
+const TTL_MS_CEILING: u64 = 7 * 24 * 60 * 60 * 1000;
+
+fn validate_ttl(timeout_ms: Option<u64>) -> ApiResult<()> {
+    match timeout_ms {
+        None => Ok(()),
+        Some(0) => Err(ApiError::from(Error::Policy(
+            "timeout_ms must be at least 1 ms".into(),
+        ))),
+        Some(ms) if ms > TTL_MS_CEILING => Err(ApiError::from(Error::Policy(format!(
+            "timeout_ms exceeds the {TTL_MS_CEILING} ms ceiling"
+        )))),
+        Some(_) => Ok(()),
+    }
+}
+
 async fn create_sandbox(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    spec: ApiJson<sandbox_core::policy::SandboxSpec>,
+    body: ApiJson<serde_json::Value>,
 ) -> ApiResult<(StatusCode, Json<SandboxView>)> {
-    // Idempotency-Key: replay returns the original sandbox (M1: creation
-    // only, no body-hash matching).
+    let ApiJson(raw) = body;
+    let create = parse_create_body(raw)?;
+    validate_ttl(create.timeout_ms)?;
+
+    // Idempotency-Key: replay returns the original sandbox (creation only,
+    // no body-hash matching).
     if let Some(record) = idempotency_lookup(&state, &headers).and_then(|id| state.get(&id)) {
         return Ok((StatusCode::OK, Json(view_of(&record))));
     }
@@ -87,8 +144,8 @@ async fn create_sandbox(
     }
 
     let id = new_sandbox_id();
-    let ctx = state.backend.provision(&id, &spec).await?;
-    let record = Arc::new(SandboxRecord::new(ctx));
+    let ctx = state.backend.provision(&id, &create.spec).await?;
+    let record = Arc::new(SandboxRecord::new(ctx, create.timeout_ms));
 
     // Provisioned → running; a failed transition here is a bug (a fresh
     // lifecycle is always Provisioning).
@@ -135,11 +192,14 @@ async fn list_sandboxes(State(state): State<SharedState>) -> Json<serde_json::Va
     Json(json!({ "sandboxes": sandboxes }))
 }
 
-/// Detail view: the summary view flattened plus the usage ledger.
+/// Detail view: the summary view flattened plus the declared TTL and the
+/// usage ledger.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SandboxDetailView {
     #[serde(flatten)]
     sandbox: SandboxView,
+    timeout_ms: Option<u64>,
     usage: crate::ledger::UsageLedger,
 }
 
@@ -149,6 +209,7 @@ async fn get_sandbox(
 ) -> ApiResult<Json<SandboxDetailView>> {
     let record = state.get(&id).ok_or_else(|| sandbox_not_found(&id))?;
     Ok(Json(SandboxDetailView {
+        timeout_ms: record.ttl_ms,
         sandbox: view_of(&record),
         usage: record.usage.lock().unwrap().clone(),
     }))
@@ -158,18 +219,26 @@ async fn delete_sandbox(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    remove_sandbox(&state, &id, "client_request").await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The single writer of termination: out of the registry and idempotency
+/// map, lifecycle → terminated, evented with its reason, then physically
+/// deprovisioned. DELETE and the reaper both land here.
+pub(crate) async fn remove_sandbox(state: &SharedState, id: &str, reason: &str) -> ApiResult<()> {
     // Remove from the registry first so concurrent calls see it gone
-    // (second DELETE → 404). Idempotency bindings die with the sandbox.
+    // (second DELETE → 404, reaper never double-terminates).
     let record = state
         .registry
         .write()
         .unwrap()
-        .remove(&id)
-        .ok_or_else(|| sandbox_not_found(&id))?;
-    state.idempotency.write().unwrap().retain(|_, v| v != &id);
+        .remove(id)
+        .ok_or_else(|| sandbox_not_found(id))?;
+    state.idempotency.write().unwrap().retain(|_, v| v != id);
 
-    // Lifecycle: running → terminated. Backend stop + deprovision then
-    // physically remove the environment.
+    // Lifecycle: running/paused → terminated. Backend stop + deprovision
+    // then physically remove the environment.
     let _ = record
         .lifecycle
         .lock()
@@ -179,10 +248,52 @@ async fn delete_sandbox(
         .events
         .lock()
         .unwrap()
-        .push(EventKind::SandboxTerminated, json!({}));
+        .push(EventKind::SandboxTerminated, json!({"reason": reason}));
 
     state.backend.stop(&record.ctx).await?;
     state.backend.deprovision(&record.ctx).await?;
+    Ok(())
+}
+
+// ---------- pause / resume ----------
+
+async fn pause_sandbox(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let record = state.get(&id).ok_or_else(|| sandbox_not_found(&id))?;
+    record
+        .lifecycle
+        .lock()
+        .unwrap()
+        .transition(LifecycleState::Paused)
+        .map_err(ApiError::from)?;
+    record
+        .events
+        .lock()
+        .unwrap()
+        .push(EventKind::SandboxPaused, json!({}));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn resume_sandbox(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let record = state.get(&id).ok_or_else(|| sandbox_not_found(&id))?;
+    record
+        .lifecycle
+        .lock()
+        .unwrap()
+        .transition(LifecycleState::Running)
+        .map_err(ApiError::from)?;
+    // Resume reopens the data plane; the caller gets a fresh idle window.
+    record.usage.lock().unwrap().refresh_activity(now_ms());
+    record
+        .events
+        .lock()
+        .unwrap()
+        .push(EventKind::SandboxResumed, json!({}));
     Ok(StatusCode::NO_CONTENT)
 }
 
