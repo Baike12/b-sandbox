@@ -13,7 +13,7 @@ pub mod net;
 
 pub use exec::ExecPolicy;
 pub use fs::{FsAccess, FsPolicy, ResolvedFsPolicy};
-pub use net::{EgressDefault, NetPolicy, ResolvedNetPolicy};
+pub use net::{Domain, EgressDefault, NetPolicy, NetTarget, ResolvedNetPolicy};
 
 use serde::{Deserialize, Serialize};
 

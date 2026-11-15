@@ -5,12 +5,17 @@
 //! `SandboxBackend` seam. Isolation backends live in sibling crates and
 //! implement the trait defined here.
 
+pub mod backend;
 pub mod budget;
 pub mod error;
 pub mod events;
 pub mod lifecycle;
 pub mod policy;
 
+pub use backend::{
+    BackendCapabilities, BackendHealth, ExecOutcome, ExecRequest, SandboxBackend, SandboxContext,
+    check_policy_support,
+};
 pub use budget::Budget;
 pub use error::{BackendFailureKind, Error, Result};
 pub use events::{Event, EventKind, EventLog};
