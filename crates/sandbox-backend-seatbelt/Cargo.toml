@@ -1,0 +1,13 @@
+[package]
+name = "sandbox-backend-seatbelt"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+sandbox-core = { path = "../sandbox-core" }
+tokio = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

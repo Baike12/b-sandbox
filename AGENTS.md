@@ -64,7 +64,7 @@ Architecture and code must read like poetry — simple, clear, elegant — and b
 
 ## Test Gate
 
-Run **`cargo gate`** (= `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`) and make it pass before calling any change done. Frontend (if any) adds `pnpm gate` = lint + typecheck + format:check + test.
+Run **`./scripts/gate.sh`** (= `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`) and make it pass before calling any change done. Frontend (if any) adds `pnpm gate` = lint + typecheck + format:check + test.
 
 - **Unit tests** sit next to the module. Lock invariants: lifecycle transitions, budget accounting, policy resolution.
 - **Adversarial tests are the product.** A sandbox is only as good as its worst test: path traversal, symlink escapes, fork bombs, output flooding, network egress attempts, zombie leakage, budget overrun. Every rule in the policy model has a test that proves a violation is denied.

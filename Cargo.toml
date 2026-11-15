@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sandbox-core",
+    "crates/sandbox-backend-seatbelt",
+    "crates/sandbox-backend-bwrap",
+    "crates/sandbox-api",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Shared dependency versions live here so the workspace stays on one lockfile.
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+axum = "0.8"
+libc = "0.2"
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = "debuginfo"
