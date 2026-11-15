@@ -411,6 +411,7 @@ dependencies = [
 name = "sandbox-backend-seatbelt"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "libc",
  "sandbox-core",
  "tempfile",

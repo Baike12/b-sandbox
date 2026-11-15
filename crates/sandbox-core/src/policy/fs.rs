@@ -109,6 +109,39 @@ pub fn normalize_absolute(raw: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Lexically normalize a sandbox-relative path (exec cwd, files data plane).
+/// The empty string maps to the sandbox root itself. Absolute paths and any
+/// `..` that escapes the root are errors — at this boundary, traversal is an
+/// attack, not a quirk.
+pub fn normalize_relative(raw: &str) -> Result<PathBuf> {
+    if raw.starts_with('/') {
+        return Err(Error::Policy(format!(
+            "sandbox-relative paths must not be absolute, got {raw:?}"
+        )));
+    }
+    let path = Path::new(raw);
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::Policy(format!(
+                    "sandbox-relative paths must not be absolute, got {raw:?}"
+                )));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err(Error::Policy(format!(
+                        "sandbox-relative path escapes the sandbox root: {raw:?}"
+                    )));
+                }
+            }
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    Ok(out)
+}
+
 impl FsPolicy {
     /// Validate and normalize into [`ResolvedFsPolicy`].
     pub fn resolve(&self) -> Result<ResolvedFsPolicy> {
@@ -238,5 +271,26 @@ mod tests {
         assert!(FsAccess::Denied > FsAccess::Readwrite);
         assert!(FsAccess::Readwrite > FsAccess::Readonly);
         assert!(FsAccess::Readonly > FsAccess::None);
+    }
+
+    #[test]
+    fn relative_normalization_rejects_absolute() {
+        let err = normalize_relative("/etc/passwd").unwrap_err();
+        assert_eq!(err.code(), "policy_validation");
+    }
+
+    #[test]
+    fn relative_normalization_resolves_inner_traversal() {
+        assert_eq!(normalize_relative("").unwrap(), PathBuf::from(""));
+        assert_eq!(normalize_relative("a/./b").unwrap(), PathBuf::from("a/b"));
+        assert_eq!(normalize_relative("a/../b").unwrap(), PathBuf::from("b"));
+    }
+
+    #[test]
+    fn relative_normalization_rejects_escape() {
+        for raw in ["..", "../x", "a/../../b"] {
+            let err = normalize_relative(raw).unwrap_err();
+            assert_eq!(err.code(), "policy_validation", "{raw:?} must be rejected");
+        }
     }
 }

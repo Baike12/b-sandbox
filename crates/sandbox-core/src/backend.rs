@@ -35,8 +35,16 @@ impl BackendCapabilities {
     pub const NET_EGRESS_DEFAULT: Self = Self(1 << 3);
     /// Can enforce per-target egress rules (CIDR / hostname).
     pub const NET_EGRESS_RULES: Self = Self(1 << 4);
-    /// Can enforce the budget (memory, pids) and exec rlimits.
-    pub const BUDGET_LIMITS: Self = Self(1 << 5);
+    /// Can enforce a memory budget (Linux cgroups / RLIMIT_AS where supported;
+    /// macOS setrlimit(RLIMIT_AS) fails with EINVAL and the kernel does not
+    /// honor it, so macOS backends must NOT declare this bit).
+    pub const BUDGET_MEMORY: Self = Self(1 << 5);
+    /// Can enforce a pids ceiling (RLIMIT_NPROC; per-uid accounting on macOS
+    /// makes it approximate in the fail-closed direction — it may over-
+    /// restrict, never under-restrict).
+    pub const BUDGET_PIDS: Self = Self(1 << 6);
+    /// Can enforce the exec rlimits (file descriptors).
+    pub const BUDGET_NOFILE: Self = Self(1 << 7);
 
     pub const fn bits(self) -> u16 {
         self.0
@@ -88,11 +96,30 @@ pub fn check_policy_support(spec: &SandboxSpec, caps: BackendCapabilities) -> Re
         ));
     }
 
-    // Budget: every sandbox must have an enforceable budget (one workload =
-    // one budget is a design invariant, not an option).
-    if !caps.has(BackendCapabilities::BUDGET_LIMITS) {
+    // Budget sections. A backend that cannot enforce a section rejects any
+    // *explicit* request for it; a value left at the built-in default is
+    // treated as "no opinion" — the backend's platform tier stays visible in
+    // /health, so the caller can see what is (not) being enforced. Memory
+    // budgets are only enforceable on the Linux tier (see BUDGET_MEMORY docs).
+    if !caps.has(BackendCapabilities::BUDGET_MEMORY)
+        && spec.budget.memory_mb != crate::budget::Budget::default().memory_mb
+    {
         return Err(Error::Policy(
-            "backend cannot enforce resource budgets (no BUDGET_LIMITS capability)".into(),
+            "backend cannot enforce a memory budget (no BUDGET_MEMORY capability); \
+             memory budgets require the Linux tier"
+                .into(),
+        ));
+    }
+    if !caps.has(BackendCapabilities::BUDGET_PIDS)
+        && spec.budget.pids_max != crate::budget::Budget::default().pids_max
+    {
+        return Err(Error::Policy(
+            "backend cannot enforce a pids ceiling (no BUDGET_PIDS capability)".into(),
+        ));
+    }
+    if !caps.has(BackendCapabilities::BUDGET_NOFILE) {
+        return Err(Error::Policy(
+            "backend cannot enforce the exec fd limit (no BUDGET_NOFILE capability)".into(),
         ));
     }
 
@@ -261,6 +288,10 @@ mod tests {
         .union(BackendCapabilities::FS_READONLY)
         .union(BackendCapabilities::FS_DENIED);
 
+    /// The macOS process tier: no memory budget, pids only.
+    const PIDS_TIER: BackendCapabilities =
+        BackendCapabilities::BUDGET_PIDS.union(BackendCapabilities::BUDGET_NOFILE);
+
     #[test]
     fn capability_bits_are_distinct() {
         let all = [
@@ -269,7 +300,9 @@ mod tests {
             BackendCapabilities::FS_DENIED,
             BackendCapabilities::NET_EGRESS_DEFAULT,
             BackendCapabilities::NET_EGRESS_RULES,
-            BackendCapabilities::BUDGET_LIMITS,
+            BackendCapabilities::BUDGET_MEMORY,
+            BackendCapabilities::BUDGET_PIDS,
+            BackendCapabilities::BUDGET_NOFILE,
         ];
         let total: u16 = all.iter().map(|c| c.bits()).fold(0, |a, b| a | b);
         assert_eq!(
@@ -281,10 +314,9 @@ mod tests {
 
     #[test]
     fn minimal_caps_accept_deny_all_spec() {
-        // A backend with only egress-default + budget can run a locked-down
-        // sandbox: no fs rules, no net rules.
-        let caps =
-            BackendCapabilities::NET_EGRESS_DEFAULT.union(BackendCapabilities::BUDGET_LIMITS);
+        // The pids-only tier (macOS) can run a locked-down sandbox: no fs
+        // rules, no net rules, default budget.
+        let caps = BackendCapabilities::NET_EGRESS_DEFAULT.union(PIDS_TIER);
         let spec = spec_with(
             FsPolicy::default(),
             NetPolicy::default(),
@@ -295,8 +327,7 @@ mod tests {
 
     #[test]
     fn fs_rules_without_their_bit_are_rejected() {
-        let caps =
-            BackendCapabilities::NET_EGRESS_DEFAULT.union(BackendCapabilities::BUDGET_LIMITS);
+        let caps = BackendCapabilities::NET_EGRESS_DEFAULT.union(PIDS_TIER);
         let spec = spec_with(
             FsPolicy {
                 readwrite: vec!["/tmp/x".into()],
@@ -322,8 +353,7 @@ mod tests {
 
     #[test]
     fn net_rules_without_rules_bit_are_rejected_even_deny_only() {
-        let caps =
-            BackendCapabilities::NET_EGRESS_DEFAULT.union(BackendCapabilities::BUDGET_LIMITS);
+        let caps = BackendCapabilities::NET_EGRESS_DEFAULT.union(PIDS_TIER);
         let spec = spec_with(
             FsPolicy::default(),
             NetPolicy {
@@ -342,7 +372,7 @@ mod tests {
 
     #[test]
     fn missing_egress_default_bit_is_always_rejected() {
-        let caps = BackendCapabilities::FS_READWRITE.union(BackendCapabilities::BUDGET_LIMITS);
+        let caps = BackendCapabilities::FS_READWRITE.union(PIDS_TIER);
         let spec = spec_with(
             FsPolicy::default(),
             NetPolicy::default(),
@@ -353,15 +383,37 @@ mod tests {
     }
 
     #[test]
-    fn missing_budget_bit_is_always_rejected() {
-        let caps = BackendCapabilities::NET_EGRESS_DEFAULT;
-        let spec = spec_with(
-            FsPolicy::default(),
-            NetPolicy::default(),
-            ExecPolicy::default(),
-        );
+    fn explicit_memory_budget_without_memory_bit_is_rejected() {
+        // macOS setrlimit(RLIMIT_AS) fails with EINVAL and the kernel does not
+        // honor the limit — a macOS-tier backend must refuse the request
+        // instead of pretending to enforce it.
+        let caps = BackendCapabilities::NET_EGRESS_DEFAULT.union(PIDS_TIER);
+        let spec = SandboxSpec {
+            budget: crate::budget::Budget {
+                memory_mb: 512,
+                pids_max: 64,
+            },
+            ..Default::default()
+        };
         let err = check_policy_support(&spec, caps).unwrap_err();
-        assert!(err.to_string().contains("BUDGET_LIMITS"));
+        assert_eq!(err.code(), "policy_validation");
+        assert!(err.to_string().contains("BUDGET_MEMORY"), "{err}");
+    }
+
+    #[test]
+    fn explicit_pids_budget_without_pids_bit_is_rejected() {
+        let caps = BackendCapabilities::NET_EGRESS_DEFAULT
+            .union(BackendCapabilities::BUDGET_MEMORY)
+            .union(BackendCapabilities::BUDGET_NOFILE);
+        let spec = SandboxSpec {
+            budget: crate::budget::Budget {
+                memory_mb: 2048,
+                pids_max: 64,
+            },
+            ..Default::default()
+        };
+        let err = check_policy_support(&spec, caps).unwrap_err();
+        assert!(err.to_string().contains("BUDGET_PIDS"), "{err}");
     }
 
     #[test]
@@ -369,7 +421,9 @@ mod tests {
         let caps = ALL_FS
             .union(BackendCapabilities::NET_EGRESS_DEFAULT)
             .union(BackendCapabilities::NET_EGRESS_RULES)
-            .union(BackendCapabilities::BUDGET_LIMITS);
+            .union(BackendCapabilities::BUDGET_MEMORY)
+            .union(BackendCapabilities::BUDGET_PIDS)
+            .union(BackendCapabilities::BUDGET_NOFILE);
         let spec = spec_with(
             FsPolicy {
                 readwrite: vec!["/tmp/x".into()],
