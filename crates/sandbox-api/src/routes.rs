@@ -35,6 +35,7 @@ pub fn route_table() -> Vec<RouteEntry> {
         ("DELETE", "/sandboxes/{id}", delete(delete_sandbox)),
         ("POST", "/sandboxes/{id}/pause", post(pause_sandbox)),
         ("POST", "/sandboxes/{id}/resume", post(resume_sandbox)),
+        ("POST", "/sandboxes/{id}/commit", post(commit_sandbox)),
         ("POST", "/sandboxes/{id}/exec", post(exec)),
         ("POST", "/sandboxes/{id}/files/read", post(file_read)),
         ("POST", "/sandboxes/{id}/files/write", post(file_write)),
@@ -340,6 +341,53 @@ async fn resume_sandbox(
         .lock()
         .unwrap()
         .push(EventKind::SandboxResumed, json!({}));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- commit (rootfs → template) ----------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommitBody {
+    name: String,
+}
+
+/// Snapshot a running sandbox's rootfs into a named template. Names are
+/// validated as single path components; existing templates are never
+/// overwritten (a template is an immutable base other sandboxes build on).
+async fn commit_sandbox(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    body: ApiJson<CommitBody>,
+) -> ApiResult<StatusCode> {
+    let ApiJson(body) = body;
+    let record = state.get(&id).ok_or_else(|| sandbox_not_found(&id))?;
+    require_running(&record, &id)?;
+
+    let tpl_dir = sandbox_core::snapshot::template_path(&state.data_root, &body.name)?;
+    if tpl_dir.exists() {
+        return Err(ApiError::from(Error::Policy(format!(
+            "template {:?} already exists; templates are immutable",
+            body.name
+        ))));
+    }
+    tokio::fs::create_dir_all(&tpl_dir)
+        .await
+        .map_err(|e| io_error(e, &tpl_dir))?;
+
+    // The tree may be large: clone it off the async runtime threads.
+    let rootfs = record.ctx.rootfs.clone();
+    tokio::task::spawn_blocking(move || sandbox_core::snapshot::snapshot_tree(&rootfs, &tpl_dir))
+        .await
+        .map_err(|e| ApiError::from(Error::Internal(format!("commit task panicked: {e}"))))?
+        .map_err(ApiError::from)?;
+
+    record
+        .events
+        .lock()
+        .unwrap()
+        .push(EventKind::TemplateCommitted, json!({"name": body.name}));
+    record.usage.lock().unwrap().refresh_activity(now_ms());
     Ok(StatusCode::NO_CONTENT)
 }
 

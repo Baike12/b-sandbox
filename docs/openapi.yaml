@@ -71,6 +71,10 @@ paths:
                 - $ref: "#/components/schemas/SandboxSpec"
                 - type: object
                   properties:
+                    template:
+                      type: string
+                      pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+                      description: Named rootfs template to materialize from; missing templates are rejected.
                     timeoutMs:
                       type: integer
                       format: int64
@@ -144,6 +148,32 @@ paths:
       parameters: [{ $ref: "#/components/parameters/SandboxId" }]
       responses:
         "204": { description: Running again }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /sandboxes/{id}/commit:
+    post:
+      tags: [lifecycle]
+      summary: Snapshot the running sandbox's rootfs into a named template
+      description: |
+        The template is an immutable base: committing an existing name is a
+        policy error. New sandboxes materialize it at creation (reflink
+        snapshot, copy-on-write where the filesystem supports it).
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+      responses:
+        "204": { description: Template committed }
+        "400": { $ref: "#/components/responses/PolicyError" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/InvalidTransition" }
 

@@ -33,6 +33,7 @@ pub enum EventKind {
     SandboxCreated,
     SandboxPaused,
     SandboxResumed,
+    TemplateCommitted,
     ExecStarted,
     ExecFinished,
     ExecTimedOut,

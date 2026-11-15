@@ -29,8 +29,14 @@ struct MockBackend {
 
 impl MockBackend {
     fn available() -> Self {
+        Self::available_in(std::env::temp_dir())
+    }
+
+    /// Backend sharing the service data root: template commits land where
+    /// provision looks them up.
+    fn available_in(data_root: PathBuf) -> Self {
         Self {
-            data_root: std::env::temp_dir(),
+            data_root,
             available: true,
         }
     }
@@ -80,6 +86,9 @@ impl SandboxBackend for MockBackend {
         let rootfs = self.data_root.join("sandboxes").join(id);
         tokio::fs::create_dir_all(&rootfs).await.unwrap();
         let rootfs = tokio::fs::canonicalize(&rootfs).await.unwrap();
+        if let Some(name) = &spec.template {
+            sandbox_core::materialize_template(&self.data_root, name, &rootfs)?;
+        }
         Ok(SandboxContext {
             id: id.to_string(),
             rootfs,
@@ -126,6 +135,11 @@ fn app_with_state(backend: MockBackend) -> (axum::Router, Arc<AppState>) {
     // The router owns the state; leak the tempdir so data outlives the test
     // (tests are short-lived; this keeps the helper signature simple).
     std::mem::forget(tmp);
+    let backend = if backend.available {
+        MockBackend::available_in(data_root.clone())
+    } else {
+        MockBackend::unavailable()
+    };
     let state = Arc::new(AppState::new(Arc::new(backend), data_root));
     (router(state.clone()), state)
 }
@@ -756,6 +770,99 @@ async fn metrics_move_in_lockstep_with_the_lifecycle() {
         "{text}"
     );
     assert!(text.contains("bsandbox_sandboxes_active 0"), "{text}");
+}
+
+// ---------- templates (commit + create-from-template) ----------
+
+#[tokio::test]
+async fn commit_then_create_from_template_round_trips() {
+    let app = app(MockBackend::available());
+    let (app, id) = create_sandbox(app).await;
+
+    let (status, _) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/files/write"),
+        Some(json!({"path": "data/env.txt", "content": "py-3.12-ready"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Commit the live rootfs into a named template.
+    let (status, body) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/commit"),
+        Some(json!({"name": "py-env"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // A new sandbox materialized from that template sees the file.
+    let (status, body) = call(
+        app.clone(),
+        "POST",
+        "/sandboxes",
+        Some(json!({"template": "py-env"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let other = body["id"].as_str().unwrap().to_string();
+    let (status, body) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{other}/files/read"),
+        Some(json!({"path": "data/env.txt"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // "py-3.12-ready" in base64.
+    assert_eq!(body["contentBase64"], "cHktMy4xMi1yZWFkeQ==");
+
+    // The commit event is in the log.
+    let (_, body) = call(app.clone(), "GET", &format!("/sandboxes/{id}/events"), None).await;
+    let kinds: Vec<&str> = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"template_committed"), "{kinds:?}");
+
+    // Templates are immutable; committing the same name again is rejected.
+    let (status, body) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/commit"),
+        Some(json!({"name": "py-env"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "policy_validation");
+
+    // Template names are single path components.
+    for bad in ["../escape", "a/b", ""] {
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            &format!("/sandboxes/{id}/commit"),
+            Some(json!({"name": bad})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "name={bad:?}");
+        assert_eq!(body["error"]["code"], "policy_validation");
+    }
+
+    // Creating from a missing template is a client error, not an empty box.
+    let (status, body) = call(
+        app,
+        "POST",
+        "/sandboxes",
+        Some(json!({"template": "no-such-tpl"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "policy_validation");
 }
 
 // ---------- macOS end-to-end with the real backend ----------
