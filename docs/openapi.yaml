@@ -1,0 +1,540 @@
+# b-sandbox OpenAPI contract.
+#
+# Hand-written and versioned: this file is the API surface clients build
+# against. tests/contract.rs asserts it matches the served route table on
+# every gate run — route/spec drift fails the build before it can ship.
+#
+# Error envelope: every non-2xx response carries
+#   {"error": {"code": "...", "message": "..."}}
+# Codes are closed (see components.errorCodes): domain codes come from
+# sandbox-core's Error model; the API layer adds exactly two registry codes.
+openapi: 3.0.3
+info:
+  title: b-sandbox API
+  description: >
+    Isolated environments for untrusted agent workloads: declarative
+    fs/net/exec policy, per-sandbox budget and usage ledger, idle-TTL
+    reaping, pause/resume lifecycle. E2B-compatible where it costs nothing.
+  version: 0.2.0
+servers:
+  - url: /
+tags:
+  - name: lifecycle
+  - name: exec
+  - name: files
+  - name: observability
+
+paths:
+  /health:
+    get:
+      tags: [observability]
+      summary: Backend availability and live sandbox count
+      responses:
+        "200":
+          description: |
+            Honest tier report: degraded (not failed) when the selected
+            backend is unavailable — the service never falls back to a
+            weaker isolation level.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok, degraded] }
+                  backend:
+                    type: object
+                    properties:
+                      name: { type: string }
+                      available: { type: boolean }
+                      reason: { type: string, nullable: true }
+                  sandboxes: { type: integer }
+
+  /sandboxes:
+    post:
+      tags: [lifecycle]
+      summary: Create a sandbox
+      description: |
+        The request body IS the sandbox spec; timeoutMs is the one envelope
+        field on top. Unknown spec fields are hard errors (fail closed).
+        Idempotency-Key header replays the original sandbox.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema: { type: string }
+          required: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SandboxSpec"
+                - type: object
+                  properties:
+                    timeoutMs:
+                      type: integer
+                      format: int64
+                      minimum: 1
+                      maximum: 604800000
+                      nullable: true
+                      description: Idle TTL in ms; the reaper terminates the sandbox after this long without data-plane activity.
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SandboxView" }
+        "200":
+          description: Idempotent replay of an existing sandbox
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SandboxView" }
+        "400": { $ref: "#/components/responses/PolicyError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+    get:
+      tags: [lifecycle]
+      summary: List sandboxes
+      responses:
+        "200":
+          description: Registry contents, sorted by id
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sandboxes:
+                    type: array
+                    items: { $ref: "#/components/schemas/SandboxView" }
+
+  /sandboxes/{id}:
+    get:
+      tags: [lifecycle]
+      summary: Sandbox detail (state, declared TTL, usage ledger)
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      responses:
+        "200":
+          description: Detail view
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SandboxDetailView" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [lifecycle]
+      summary: Terminate and remove a sandbox
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      responses:
+        "204": { description: Terminated and deprovisioned }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/BackendError" }
+
+  /sandboxes/{id}/pause:
+    post:
+      tags: [lifecycle]
+      summary: Pause a running sandbox (environment preserved, data plane closed)
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      responses:
+        "204": { description: Paused }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /sandboxes/{id}/resume:
+    post:
+      tags: [lifecycle]
+      summary: Resume a paused sandbox (fresh idle-TTL window)
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      responses:
+        "204": { description: Running again }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /sandboxes/{id}/exec:
+    post:
+      tags: [exec]
+      summary: Run a command in the sandbox (no shell; argv passed verbatim)
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ExecRequest" }
+      responses:
+        "200":
+          description: Outcome; timeout is a result flag, not an error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExecOutcome" }
+        "400": { $ref: "#/components/responses/PolicyError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+        "502": { $ref: "#/components/responses/BackendError" }
+
+  /sandboxes/{id}/files/read:
+    post:
+      tags: [files]
+      summary: Read a file (base64 content)
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        "200":
+          description: File content
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path: { type: string }
+                  contentBase64: { type: string }
+                  size: { type: integer }
+        "400": { $ref: "#/components/responses/PolicyError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /sandboxes/{id}/files/write:
+    post:
+      tags: [files]
+      summary: Write a file (missing parents are created)
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, content]
+              properties:
+                path: { type: string }
+                content: { type: string }
+      responses:
+        "204": { description: Written }
+        "400": { $ref: "#/components/responses/PolicyError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /sandboxes/{id}/files/list:
+    post:
+      tags: [files]
+      summary: List a directory
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        "200":
+          description: Entries sorted by name
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        type: { type: string, enum: [file, dir, symlink] }
+                        size: { type: integer }
+        "400": { $ref: "#/components/responses/PolicyError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /sandboxes/{id}/files/stat:
+    post:
+      tags: [files]
+      summary: Stat a path
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        "200":
+          description: Metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path: { type: string }
+                  type: { type: string, enum: [file, dir] }
+                  size: { type: integer }
+        "400": { $ref: "#/components/responses/PolicyError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /sandboxes/{id}/files/mkdir:
+    post:
+      tags: [files]
+      summary: Create a directory (parents included)
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        "204": { description: Created }
+        "400": { $ref: "#/components/responses/PolicyError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /sandboxes/{id}/files/remove:
+    post:
+      tags: [files]
+      summary: Remove a file or directory
+      parameters: [{ $ref: "#/components/parameters/SandboxId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+                recursive: { type: boolean, default: false }
+      responses:
+        "204": { description: Removed }
+        "400": { $ref: "#/components/responses/PolicyError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /sandboxes/{id}/events:
+    get:
+      tags: [observability]
+      summary: Sandbox event stream tail (monotonic seq, after-cursor read)
+      parameters:
+        - { $ref: "#/components/parameters/SandboxId" }
+        - in: query
+          name: after
+          schema: { type: integer, format: int64 }
+          description: Return events with seq > after.
+      responses:
+        "200":
+          description: Events and cursor state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventsResponse" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /metrics:
+    get:
+      tags: [observability]
+      summary: Prometheus text exposition (0.0.4)
+      responses:
+        "200":
+          description: |
+            bsandbox_* counters and gauges: sandboxes created/active/
+            terminated/reaped, execs started/finished/timed_out/truncated,
+            exec output bytes, file ops.
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  parameters:
+    SandboxId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, pattern: "^sbx-[0-9a-f]{16}$" }
+
+  responses:
+    PolicyError:
+      description: Policy/budget validation failure (fail closed)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    InvalidTransition:
+      description: Lifecycle state forbids the operation
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: Sandbox not found in the registry
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    BackendError:
+      description: Backend operation failed (details logged server-side)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    BackendUnavailable:
+      description: Selected backend is unavailable — never a weaker fallback
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+
+    SandboxSpec:
+      type: object
+      description: |
+        Declarative policy. Every section is optional and defaults to the
+        most restrictive posture. Unknown fields anywhere are errors.
+      properties:
+        fs:
+          type: object
+          properties:
+            readwrite:
+              type: array
+              items: { type: string }
+              description: Kernel-canonical absolute paths the workload may write.
+            readonly:
+              type: array
+              items: { type: string }
+            denied:
+              type: array
+              items: { type: string }
+        net:
+          type: object
+          properties:
+            egress:
+              type: object
+              properties:
+                mode: { type: string, enum: [deny, allow] }
+                allow:
+                  type: array
+                  items: { type: string }
+                deny:
+                  type: array
+                  items: { type: string }
+        exec:
+          type: object
+          properties:
+            maxOutputBytes: { type: integer, format: int64 }
+            maxOpenFiles: { type: integer }
+        budget:
+          type: object
+          properties:
+            memoryMb: { type: integer }
+            pidsMax: { type: integer }
+
+    SandboxView:
+      type: object
+      properties:
+        id: { type: string }
+        state: { type: string, enum: [provisioning, running, paused, terminated] }
+        rootfs: { type: string }
+
+    SandboxDetailView:
+      allOf:
+        - $ref: "#/components/schemas/SandboxView"
+        - type: object
+          properties:
+            timeoutMs: { type: integer, nullable: true }
+            usage: { $ref: "#/components/schemas/UsageLedger" }
+
+    UsageLedger:
+      type: object
+      properties:
+        createdAtMs: { type: integer, format: int64 }
+        lastActivityMs: { type: integer, format: int64 }
+        execsStarted: { type: integer }
+        execsFinished: { type: integer }
+        execsTimedOut: { type: integer }
+        execWallMs: { type: integer, format: int64 }
+        outputBytes: { type: integer, format: int64 }
+        fileOps: { type: integer }
+
+    ExecRequest:
+      type: object
+      required: [command]
+      properties:
+        command: { type: string, maxLength: 4096 }
+        args:
+          type: array
+          items: { type: string }
+          maxItems: 1024
+        env:
+          type: object
+          additionalProperties: { type: string }
+        cwd: { type: string }
+        timeoutMs:
+          type: integer
+          format: int64
+          maximum: 600000
+
+    ExecOutcome:
+      type: object
+      properties:
+        exitCode: { type: integer, nullable: true }
+        timedOut: { type: boolean }
+        stdout: { type: string }
+        stderr: { type: string }
+        truncated: { type: boolean }
+
+    EventsResponse:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            type: object
+            properties:
+              seq: { type: integer }
+              tsMs: { type: integer, format: int64 }
+              kind:
+                type: string
+                enum:
+                  - sandbox_created
+                  - sandbox_paused
+                  - sandbox_resumed
+                  - exec_started
+                  - exec_finished
+                  - exec_timed_out
+                  - sandbox_killed
+                  - sandbox_terminated
+                  - policy_denied
+              data: { type: object }
+        lastSeq: { type: integer }
+        dropped: { type: integer }
+
+  # Closed error-code vocabulary. Domain codes come from sandbox-core's
+  # Error model; the API layer adds the two registry codes. tests/contract.rs
+  # asserts every code here stays in sync with the code() implementations.
+  errorCodes:
+    domain:
+      - policy_validation
+      - invalid_transition
+      - budget_rejected
+      - backend_spawn_failed
+      - backend_kill_failed
+      - backend_io_failed
+      - backend_error
+      - internal
+    registry:
+      - sandbox_not_found
+      - backend_unavailable

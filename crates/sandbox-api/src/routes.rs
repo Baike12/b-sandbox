@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post};
+use axum::routing::{MethodRouter, delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -19,23 +19,54 @@ use crate::state::{SandboxRecord, SharedState, new_sandbox_id};
 use sandbox_core::events::EventKind;
 use sandbox_core::{Error, ExecOutcome, LifecycleState};
 
+/// One route of the route table: (method, path, handler).
+pub type RouteEntry = (&'static str, &'static str, MethodRouter<SharedState>);
+
+/// The route table: the single source of truth for the served surface. The
+/// router is built from it, and the OpenAPI contract test
+/// (tests/contract.rs) proves table ↔ router ↔ spec equivalence — a new
+/// handler that skips the table fails the gate.
+pub fn route_table() -> Vec<RouteEntry> {
+    vec![
+        ("GET", "/health", get(health)),
+        ("POST", "/sandboxes", post(create_sandbox)),
+        ("GET", "/sandboxes", get(list_sandboxes)),
+        ("GET", "/sandboxes/{id}", get(get_sandbox)),
+        ("DELETE", "/sandboxes/{id}", delete(delete_sandbox)),
+        ("POST", "/sandboxes/{id}/pause", post(pause_sandbox)),
+        ("POST", "/sandboxes/{id}/resume", post(resume_sandbox)),
+        ("POST", "/sandboxes/{id}/exec", post(exec)),
+        ("POST", "/sandboxes/{id}/files/read", post(file_read)),
+        ("POST", "/sandboxes/{id}/files/write", post(file_write)),
+        ("POST", "/sandboxes/{id}/files/list", post(file_list)),
+        ("POST", "/sandboxes/{id}/files/stat", post(file_stat)),
+        ("POST", "/sandboxes/{id}/files/mkdir", post(file_mkdir)),
+        ("POST", "/sandboxes/{id}/files/remove", post(file_remove)),
+        ("GET", "/sandboxes/{id}/events", get(events)),
+        ("GET", "/metrics", get(metrics)),
+    ]
+}
+
 pub fn router(state: SharedState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/sandboxes", post(create_sandbox).get(list_sandboxes))
-        .route("/sandboxes/{id}", get(get_sandbox).delete(delete_sandbox))
-        .route("/sandboxes/{id}/pause", post(pause_sandbox))
-        .route("/sandboxes/{id}/resume", post(resume_sandbox))
-        .route("/sandboxes/{id}/exec", post(exec))
-        .route("/sandboxes/{id}/files/read", post(file_read))
-        .route("/sandboxes/{id}/files/write", post(file_write))
-        .route("/sandboxes/{id}/files/list", post(file_list))
-        .route("/sandboxes/{id}/files/stat", post(file_stat))
-        .route("/sandboxes/{id}/files/mkdir", post(file_mkdir))
-        .route("/sandboxes/{id}/files/remove", post(file_remove))
-        .route("/sandboxes/{id}/events", get(events))
-        .route("/metrics", get(metrics))
-        .with_state(state)
+    let table = route_table();
+    // Same-path entries with different methods fold into one MethodRouter —
+    // axum rejects duplicate registrations of the same path.
+    let paths: std::collections::BTreeSet<&'static str> =
+        table.iter().map(|(_, path, _)| *path).collect();
+    let mut router = Router::new();
+    for path in paths {
+        let handlers: Vec<MethodRouter<SharedState>> = table
+            .iter()
+            .filter(|(_, p, _)| *p == path)
+            .map(|(_, _, handler)| handler.clone())
+            .collect();
+        let mut merged = handlers.first().expect("table path has handlers").clone();
+        for handler in handlers.iter().skip(1) {
+            merged = merged.merge(handler.clone());
+        }
+        router = router.route(path, merged);
+    }
+    router.with_state(state)
 }
 
 // ---------- health ----------
