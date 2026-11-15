@@ -11,26 +11,47 @@ b-sandbox is a sandbox service for [b-superagent](../b-superagent): it runs untr
 
 ## Project Structure
 
-Planned shape — keep this table honest as code lands:
+Keep this table honest as code lands. Entry point: `sandbox-api --data-root <dir> [--port 8094] [--backend seatbelt|bwrap]`.
 
 ```
-crates/                      Rust workspace
-├── sandbox-core             workload lifecycle, policy model, isolation backends (trait + impls)
-├── sandbox-api              HTTP API service (axum): routing, auth, error mapping
-├── sandbox-sdk              client SDK (Rust first; TS SDK when b-superagent needs one)
-web/                         TS + React console (only when needed)
-docs/                        design docs and RFCs (Chinese, for humans)
-vendor/                      reference open-source sandboxes — read-only, see vendor/README.md
-deploy/                      Dockerfile, compose.yaml, nginx snippet (aligned with ../b-superagent)
-scripts/                     dev.sh, deploy.sh, server_setup.sh, remote_run.sh
+crates/                          Rust workspace
+├── sandbox-core/                pure domain, no platform code
+│   ├── error.rs                 closed error enum + stable codes (API contract)
+│   ├── policy/{fs,net,exec}.rs  policy model: fs strictest-wins normalization,
+│   │                            protected network ranges, exec bounds
+│   ├── lifecycle.rs             state machine (provisioning→running→terminated)
+│   ├── budget.rs                memory/pids ceilings (bound-checked, no clamping)
+│   ├── events.rs                monotonic-seq bounded event log with after-cursor
+│   └── backend.rs               SandboxBackend trait + capability bits +
+│                                check_policy_support (reject-don't-degrade)
+├── sandbox-backend-seatbelt/    macOS Seatbelt process backend
+│   ├── profile.rs               policy → scheme (pure fn, unit-tested)
+│   ├── ffi.rs                   sandbox_init seam (returns int; applied in pre_exec)
+│   └── tests/integration.rs     enforcement-evidence suite on real processes
+├── sandbox-backend-bwrap/       Linux Bubblewrap backend
+│   ├── profile.rs               policy → argv (pure fn, unit-tested)
+│   └── tests/integration.rs     linux-gated; runs only where bwrap exists
+├── sandbox-api/                 axum REST service (lib + thin bin in main.rs)
+│   ├── routes.rs                lifecycle/exec/files/events/health handlers
+│   ├── files.rs                 sandbox-relative path resolution (traversal +
+│   │                            symlink escapes are policy_validation errors)
+│   ├── state.rs                 registry (Arc records), id minting, idempotency
+│   ├── error.rs                 code→status mapping, ApiJson envelope extractor
+│   └── b64.rs                   local base64 (one function, no dependency)
+docs/                            design docs and RFCs (design.md 中文, plan.md English)
+vendor/                          reference open-source sandboxes — read-only, see vendor/README.md
+scripts/gate.sh                  fmt + clippy -D warnings + test --workspace
+web/, deploy/, sdk/              not yet (M2+: console, deploy pipeline, client SDK)
 ```
 
 ### Key Concepts
 
 - **One workload = one isolated environment = one budget.** CPU/memory/time/network limits are declared at creation, enforced by the backend, observable for the whole lifetime. No workload exists without them.
 - **Policy is data, not flags.** Filesystem/network/exec permissions are declarative policies attached to a workload; enforcement lives in one place per backend, never scattered across call sites.
-- **The backend is a seam.** Everything above the backend trait (lifecycle, policy, API, observability) is backend-agnostic: container vs process vs microVM differ only behind the trait. Adding a backend touches nothing else.
-- **Fail closed.** Missing policy, unknown backend, failed enforcement, ambiguous path → deny. A sandbox that degrades silently is a security bug, and "mostly isolated" is not isolated.
+- **The backend is a seam.** Everything above the backend trait (lifecycle, policy, API, observability) is backend-agnostic: process vs container vs microVM differ only behind the trait. Adding a backend touches nothing else.
+- **Fail closed.** Missing policy, unknown backend, failed enforcement, ambiguous path → deny. A sandbox that degrades silently is a security bug, and "mostly isolated" is not isolated. Concretely: `check_policy_support` rejects specs asking for capabilities a backend does not declare; `/health` reports the honest tier; explicit memory budgets are refused on the macOS tier (where they cannot be enforced).
+- **Capability declarations need enforcement evidence.** Every bit a backend sets must be backed by a test that flips a policy input and observes the workload's behavior change.
+- **Paths are canonical.** fs policy paths and the file data plane operate on kernel-canonical spellings (macOS: /private/var/..., not /var/...); Seatbelt matches the caller's literal string, so both policy and workload must use the same canonical form.
 
 ## Code Quality
 

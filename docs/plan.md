@@ -2,6 +2,8 @@
 
 Status: v0.1 (2026-11-15). Companion to [design.md](./design.md) (Chinese; the architecture contract). This plan is the build order. Files, comments and docs in this repository are English from this point on.
 
+**M1 status: landed.** Modules M-1 through M-8 are implemented and committed (see `git log`); the gate (`scripts/gate.sh`) is green with ~130 tests, including the 18-test Seatbelt enforcement-evidence suite and API black-box adversarial tests. macOS findings that adjusted the plan: `setrlimit(RLIMIT_AS)` fails on macOS so the macOS tier declares no `BUDGET_MEMORY` capability; Seatbelt matches path literals (no kernel re-resolution) so policy and data-plane paths are canonicalized at provision/exec time. Linux (bwrap) integration tests remain gated on a Linux host, as planned.
+
 ## 0. Development discipline
 
 Every module follows the same loop, and no module is committed without its gate:
