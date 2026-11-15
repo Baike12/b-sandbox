@@ -26,6 +26,8 @@ pub struct AppState {
     pub idempotency: RwLock<HashMap<String, String>>,
     /// Root for backend data (rootfs dirs live under data_root/sandboxes).
     pub data_root: std::path::PathBuf,
+    /// Service-level counters (lock-free atomics; scrape derives gauges).
+    pub metrics: crate::metrics::Metrics,
 }
 
 pub struct SandboxRecord {
@@ -58,6 +60,7 @@ impl AppState {
             registry: RwLock::new(HashMap::new()),
             idempotency: RwLock::new(HashMap::new()),
             data_root,
+            metrics: Default::default(),
         }
     }
 

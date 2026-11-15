@@ -698,6 +698,54 @@ async fn create_with_body(app: &axum::Router, body: Value) -> String {
     body["id"].as_str().unwrap().to_string()
 }
 
+// ---------- metrics ----------
+
+#[tokio::test]
+async fn metrics_move_in_lockstep_with_the_lifecycle() {
+    let app = app(MockBackend::available());
+    let (app, id) = create_sandbox(app).await;
+
+    call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/exec"),
+        Some(json!({"command": "echo"})),
+    )
+    .await;
+    call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/files/write"),
+        Some(json!({"path": "a.txt", "content": "x"})),
+    )
+    .await;
+
+    let (status, body) = call(app.clone(), "GET", "/metrics", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = body.as_str().unwrap_or("");
+    assert!(
+        text.contains("bsandbox_sandboxes_created_total 1"),
+        "{text}"
+    );
+    assert!(text.contains("bsandbox_sandboxes_active 1"), "{text}");
+    assert!(text.contains("bsandbox_execs_started_total 1"), "{text}");
+    assert!(text.contains("bsandbox_execs_finished_total 1"), "{text}");
+    assert!(
+        text.contains("bsandbox_exec_output_bytes_total 15"),
+        "{text}"
+    );
+    assert!(text.contains("bsandbox_file_ops_total 1"), "{text}");
+
+    call(app.clone(), "DELETE", &format!("/sandboxes/{id}"), None).await;
+    let (_, body) = call(app, "GET", "/metrics", None).await;
+    let text = body.as_str().unwrap_or("");
+    assert!(
+        text.contains("bsandbox_sandboxes_terminated_total 1"),
+        "{text}"
+    );
+    assert!(text.contains("bsandbox_sandboxes_active 0"), "{text}");
+}
+
 // ---------- macOS end-to-end with the real backend ----------
 
 #[cfg(target_os = "macos")]

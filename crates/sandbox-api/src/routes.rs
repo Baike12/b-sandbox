@@ -34,6 +34,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/sandboxes/{id}/files/mkdir", post(file_mkdir))
         .route("/sandboxes/{id}/files/remove", post(file_remove))
         .route("/sandboxes/{id}/events", get(events))
+        .route("/metrics", get(metrics))
         .with_state(state)
 }
 
@@ -51,6 +52,18 @@ async fn health(State(state): State<SharedState>) -> Json<serde_json::Value> {
         },
         "sandboxes": count,
     }))
+}
+
+async fn metrics(State(state): State<SharedState>) -> impl axum::response::IntoResponse {
+    let active = state.registry.read().unwrap().len() as u64;
+    let body = state.metrics.render(active);
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
 }
 
 // ---------- lifecycle ----------
@@ -162,6 +175,7 @@ async fn create_sandbox(
         .push(EventKind::SandboxCreated, json!({}));
 
     let view = view_of(&record);
+    state.metrics.inc_sandboxes_created();
     state
         .registry
         .write()
@@ -250,6 +264,7 @@ pub(crate) async fn remove_sandbox(state: &SharedState, id: &str, reason: &str) 
         .unwrap()
         .push(EventKind::SandboxTerminated, json!({"reason": reason}));
 
+    state.metrics.inc_sandboxes_terminated();
     state.backend.stop(&record.ctx).await?;
     state.backend.deprovision(&record.ctx).await?;
     Ok(())
@@ -346,6 +361,7 @@ async fn exec(
         .unwrap()
         .push(EventKind::ExecStarted, json!({"command": request.command}));
     record.usage.lock().unwrap().record_exec_started(now_ms());
+    state.metrics.inc_execs_started();
 
     let started = std::time::Instant::now();
     let outcome = state.backend.exec(&record.ctx, request.clone()).await?;
@@ -357,6 +373,9 @@ async fn exec(
         output_bytes,
         now_ms(),
     );
+    state
+        .metrics
+        .record_exec_outcome(outcome.timed_out, outcome.truncated, output_bytes);
 
     let (kind, data) = if outcome.timed_out {
         (
@@ -411,9 +430,10 @@ fn require_running(record: &SandboxRecord, id: &str) -> ApiResult<()> {
     }
 }
 
-/// One successful file operation = one counted operation.
-fn record_file_op(record: &SandboxRecord) {
+/// One successful file operation = one counted operation (ledger + metrics).
+fn record_file_op(state: &SharedState, record: &SandboxRecord) {
     record.usage.lock().unwrap().record_file_op(now_ms());
+    state.metrics.inc_file_ops();
 }
 
 async fn file_read(
@@ -427,7 +447,7 @@ async fn file_read(
     let content = tokio::fs::read(&path)
         .await
         .map_err(|e| io_error(e, &path))?;
-    record_file_op(&record);
+    record_file_op(&state, &record);
     Ok(Json(json!({
         "path": body.path,
         "contentBase64": crate::b64::encode(&content),
@@ -454,7 +474,7 @@ async fn file_write(
     tokio::fs::write(&path, body.content.as_bytes())
         .await
         .map_err(|e| io_error(e, &path))?;
-    record_file_op(&record);
+    record_file_op(&state, &record);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -493,7 +513,7 @@ async fn file_list(
         }));
     }
     entries.sort_by_key(|e| e["name"].as_str().unwrap_or("").to_string());
-    record_file_op(&record);
+    record_file_op(&state, &record);
     Ok(Json(json!({ "entries": entries })))
 }
 
@@ -508,7 +528,7 @@ async fn file_stat(
     let meta = tokio::fs::metadata(&path)
         .await
         .map_err(|e| io_error(e, &path))?;
-    record_file_op(&record);
+    record_file_op(&state, &record);
     Ok(Json(json!({
         "path": body.path,
         "type": if meta.is_dir() { "dir" } else { "file" },
@@ -527,7 +547,7 @@ async fn file_mkdir(
     tokio::fs::create_dir_all(&path)
         .await
         .map_err(|e| io_error(e, &path))?;
-    record_file_op(&record);
+    record_file_op(&state, &record);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -557,7 +577,7 @@ async fn file_remove(
             .await
             .map_err(|e| io_error(e, &path))?;
     }
-    record_file_op(&record);
+    record_file_op(&state, &record);
     Ok(StatusCode::NO_CONTENT)
 }
 

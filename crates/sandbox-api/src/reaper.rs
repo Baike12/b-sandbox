@@ -37,6 +37,7 @@ pub async fn sweep(state: &SharedState) -> usize {
     };
     for id in &expired_ids {
         let _ = crate::routes::remove_sandbox(state, id, "idle_ttl_expired").await;
+        state.metrics.inc_sandboxes_reaped();
     }
     expired_ids.len()
 }
