@@ -26,6 +26,9 @@ axum = "0.8"
 libc = "0.2"
 tokio-stream = { version = "0.1", default-features = false, features = ["time", "sync"] }
 tempfile = "3"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 
 [profile.release]
 lto = true

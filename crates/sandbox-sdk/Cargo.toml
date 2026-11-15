@@ -6,3 +6,15 @@ license.workspace = true
 
 [dependencies]
 sandbox-core = { path = "../sandbox-core" }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+sandbox-api = { path = "../sandbox-api" }
+axum = { workspace = true }
+tempfile = { workspace = true }
+async-trait = { workspace = true }
