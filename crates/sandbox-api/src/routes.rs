@@ -49,6 +49,14 @@ pub fn route_table() -> Vec<RouteEntry> {
         ("GET", "/sandboxes/{id}/events", get(events)),
         ("GET", "/sandboxes/{id}/events/stream", get(events_stream)),
         ("GET", "/metrics", get(metrics)),
+        // Web console: "/" redirects, "/console" serves index.html,
+        // "/console/{*rest}" serves build assets. Static files carry no
+        // secrets (the console asks for the token in the browser), so the
+        // auth middleware exempts them like /health — the API routes behind
+        // the console stay fully protected.
+        ("GET", "/", get(root_redirect)),
+        ("GET", "/console", get(console_index)),
+        ("GET", "/console/{*rest}", get(console_asset)),
     ]
 }
 
@@ -148,7 +156,7 @@ async fn auth_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, ApiError> {
-    if req.uri().path() == "/health" || state.auth_token.is_none() {
+    if is_open_path(req.uri().path()) || state.auth_token.is_none() {
         return Ok(next.run(req).await);
     }
     let ok = req
@@ -272,6 +280,8 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     loop {
         match (pattern.next(), path.next()) {
             (None, None) => return true,
+            // Trailing catch-all ("{*rest}"): consumes one or more segments.
+            (Some("{*rest}"), Some(_)) => return true,
             (Some(p), Some(s)) => {
                 if !(p.starts_with('{') || p == s) {
                     return false;
@@ -332,6 +342,61 @@ mod tests {
         assert!(path_matches("/health", "/health"));
         assert!(!path_matches("/health", "/healthz"));
     }
+}
+
+// ---------- web console ----------
+
+/// Paths that answer without a bearer token: the liveness probe and the
+/// static console (the console is unauthenticated chrome — it collects the
+/// token in the browser; every API route it calls stays protected).
+fn is_open_path(path: &str) -> bool {
+    path == "/health" || path == "/" || path == "/console" || path.starts_with("/console/")
+}
+
+async fn root_redirect() -> axum::response::Redirect {
+    axum::response::Redirect::temporary("/console")
+}
+
+/// Serve a file from the console build directory. The rest path is
+/// sandbox-relative-strict: no `..`, no absolute, no symlink escape — the
+/// same traversal posture as the sandbox file plane.
+async fn console_asset(
+    State(state): State<SharedState>,
+    axum::extract::Path(rest): axum::extract::Path<String>,
+) -> ApiResult<axum::response::Response> {
+    serve_console(&state, &rest).await
+}
+
+async fn console_index(State(state): State<SharedState>) -> ApiResult<axum::response::Response> {
+    serve_console(&state, "index.html").await
+}
+
+async fn serve_console(state: &SharedState, rest: &str) -> ApiResult<axum::response::Response> {
+    let dir = state.console_dir.as_ref().ok_or_else(|| {
+        ApiError::from(Error::Policy(
+            "console not built: run `pnpm build` in web/ (or pass --console-dir)".into(),
+        ))
+    })?;
+    if rest.is_empty() || rest.split('/').any(|seg| seg == ".." || seg.is_empty()) {
+        return Err(ApiError::from(Error::Policy("bad console path".into())));
+    }
+    let path = dir.join(rest);
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| ApiError::from(Error::Policy(format!("console asset not found: {rest}"))))?;
+    let content_type = match path.extension().and_then(|e| e.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript",
+        Some("css") => "text/css",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("json") => "application/json",
+        Some("map") => "application/json",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    Ok(([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response())
 }
 
 // ---------- health ----------

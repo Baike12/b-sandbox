@@ -198,6 +198,32 @@ async fn call_raw(app: axum::Router, method: &str, uri: &str) -> (StatusCode, St
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// `call` plus response headers — for content-type/location assertions.
+async fn call_full(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value, axum::http::HeaderMap) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if body.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
+    let req = builder
+        .body(Body::from(body.map(|v| v.to_string()).unwrap_or_default()))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value, headers)
+}
+
 fn create_body() -> Value {
     json!({})
 }
@@ -1167,6 +1193,64 @@ async fn sse_stream_ends_when_the_server_drains() {
         }
     }
     assert!(seen.contains("event: sandbox_created"), "{seen}");
+}
+
+// ---------- web console ----------
+
+/// The console is served from a build directory: "/" redirects to
+/// "/console", "/console" serves index.html, assets resolve inside the dir,
+/// traversal is refused, and without a build the route answers the hint.
+#[tokio::test]
+async fn console_serves_the_build_and_refuses_traversal() {
+    let build = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(build.path().join("assets")).unwrap();
+    std::fs::write(build.path().join("index.html"), "<html>console</html>").unwrap();
+    std::fs::write(build.path().join("assets/app.js"), "console.log(1)").unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(
+            Arc::new(MockBackend::available_in(tmp.path().to_path_buf())),
+            tmp.path().to_path_buf(),
+        )
+        .with_console_dir(build.path().to_path_buf()),
+    );
+    let app = router(state.clone());
+
+    // "/" redirects to the console.
+    let (status, _, headers) = call_full(app.clone(), "GET", "/", None).await;
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(headers["location"], "/console");
+
+    // index.html and assets are served with content types.
+    let (status, _, headers) = call_full(app.clone(), "GET", "/console", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+    let (_, js) = call_raw(app.clone(), "GET", "/console/assets/app.js").await;
+    assert!(js.contains("console.log"), "{js}");
+    let (status, _, headers) = call_full(app.clone(), "GET", "/console/assets/app.js", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/javascript");
+
+    // Traversal is a policy error, not a file read.
+    let (status, body, _) = call_full(app, "GET", "/console/../secret.txt", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "policy_validation");
+}
+
+/// Without a build directory the console routes answer with the build hint.
+#[tokio::test]
+async fn console_without_a_build_answers_the_hint() {
+    let app = app(MockBackend::available());
+    let (status, body) = call(app, "GET", "/console", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pnpm build"),
+        "{body}"
+    );
 }
 
 // ---------- auth ----------

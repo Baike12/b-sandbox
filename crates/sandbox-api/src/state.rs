@@ -38,6 +38,9 @@ pub struct AppState {
     /// Set just before graceful shutdown drains the server; long-lived SSE
     /// tails watch it and end their streams so connections can close.
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Root of the web console build (web/dist). None = console routes
+    /// answer with a build hint instead of files.
+    pub console_dir: Option<std::path::PathBuf>,
 }
 
 pub struct SandboxRecord {
@@ -74,7 +77,20 @@ impl AppState {
             auth_token: None,
             route_patterns: crate::routes::route_patterns(),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            console_dir: None,
         }
+    }
+
+    /// Serve the web console build from `dir`.
+    pub fn with_console_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.console_dir = Some(dir);
+        self
+    }
+
+    /// Same, but `None` leaves the console off (routes answer with a hint).
+    pub fn with_console_dir_opt(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.console_dir = dir;
+        self
     }
 
     /// Require a bearer token on every route except /health.

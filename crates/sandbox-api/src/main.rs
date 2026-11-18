@@ -32,6 +32,9 @@ struct Config {
     /// --egress-credentials; proxy-mode sandboxes are refused without both.
     egress_proxy: Option<String>,
     egress_credentials: Option<String>,
+    /// Web console build directory (web/dist). None → console routes answer
+    /// with a build hint.
+    console_dir: Option<PathBuf>,
 }
 
 /// Structured logging: `tracing` to stderr, level from `B_SANDBOX_LOG`
@@ -61,6 +64,13 @@ fn parse_args() -> Config {
         auth_token: None,
         egress_proxy: None,
         egress_credentials: None,
+        // Serve the console when a build exists next to the repo root —
+        // zero-config for the common layout, overridable, and absent in a
+        // bare deploy without a console build.
+        console_dir: std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join("web/dist"))
+            .filter(|dir| dir.join("index.html").is_file()),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -96,8 +106,17 @@ fn parse_args() -> Config {
                 cfg.egress_credentials =
                     Some(args.next().expect("--egress-credentials needs a value"))
             }
+            "--console-dir" => {
+                cfg.console_dir = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .expect("--console-dir needs a value"),
+                )
+            }
             other => {
-                panic!("unknown argument {other:?} (expected --data-root/--port/--bind/--backend)")
+                panic!(
+                    "unknown argument {other:?} (expected --data-root/--port/--bind/--backend/--console-dir)"
+                )
             }
         }
     }
@@ -218,7 +237,8 @@ fn main() {
 
     let state = Arc::new(
         sandbox_api::state::AppState::new(backend, cfg.data_root.clone())
-            .with_auth_token(cfg.auth_token),
+            .with_auth_token(cfg.auth_token)
+            .with_console_dir_opt(cfg.console_dir.clone()),
     );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

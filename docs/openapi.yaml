@@ -24,6 +24,7 @@ servers:
   - url: /
 tags:
   - name: lifecycle
+  - name: console
   - name: exec
   - name: files
   - name: observability
@@ -416,8 +417,52 @@ paths:
             text/plain:
               schema: { type: string }
 
+  /:
+    get:
+      tags: [console]
+      summary: Redirect to the web console
+      security: [] # static redirect, no secrets
+      responses:
+        "303":
+          description: Redirect to /console
+
+  /console:
+    get:
+      tags: [console]
+      summary: Web console (single-page onboarding + management UI)
+      description: |
+        Served from the console build directory (web/dist, or --console-dir).
+        Unauthenticated static chrome — the console collects the token in the
+        browser; every API route it calls stays protected. Without a build
+        the route answers 400 with a build hint.
+      security: []
+      responses:
+        "200":
+          description: index.html of the console build
+          content:
+            text/html:
+              schema: { type: string }
+        "400": { $ref: "#/components/responses/PolicyError" }
+
+  /console/{*rest}:
+    get:
+      tags: [console]
+      summary: Console build assets (js/css/…)
+      security: []
+      parameters:
+        - in: path
+          name: rest
+          required: true
+          schema: { type: string }
+          description: Asset path relative to the build root; traversal segments are refused.
+      responses:
+        "200":
+          description: The asset, content-type by extension
+        "400": { $ref: "#/components/responses/PolicyError" }
+
 # Default: every route requires the bearer token when one is configured.
-# /health opts out (liveness probes must never need credentials).
+# /health and the console routes opt out (liveness probes and the static
+# console must never need credentials).
 security:
   - bearerAuth: []
 
