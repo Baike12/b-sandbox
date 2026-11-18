@@ -1032,6 +1032,48 @@ async fn sse_stream_ends_after_its_sandbox_terminates() {
     assert!(seen.contains("event: sandbox_terminated"), "{seen}");
 }
 
+/// Graceful shutdown closes open SSE tails via the shared shutdown flag, so
+/// axum's drain phase can actually finish instead of waiting on them.
+#[tokio::test]
+async fn sse_stream_ends_when_the_server_drains() {
+    let (app, state) = app_with_state(MockBackend::available());
+    let (app, id) = create_sandbox(app).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/sandboxes/{id}/events/stream?after=0"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    // The drain signal: same flag the SIGTERM handler sets.
+    state
+        .shutdown
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let mut seen = String::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(3), body.frame()).await {
+            Err(_) => panic!("stream did not end on shutdown: {seen}"),
+            Ok(None) => break,
+            Ok(Some(Err(e))) => panic!("body error: {e}"),
+            Ok(Some(Ok(frame))) => {
+                seen.push_str(&String::from_utf8_lossy(
+                    &frame.into_data().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    assert!(seen.contains("event: sandbox_created"), "{seen}");
+}
+
 // ---------- auth ----------
 
 /// Router with a token configured (state built directly).

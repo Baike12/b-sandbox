@@ -104,6 +104,75 @@ pub fn new_sandbox_id() -> String {
     format!("sbx-{hex}")
 }
 
+/// Single-instance guard on a data root: two b-sandbox processes sharing one
+/// `data_root` would each see (and reap) the other's sandboxes as orphans.
+/// The lock is a pid file; a stale file — its pid is gone, e.g. after a
+/// crash — is stolen, so a dead process never wedges the service.
+#[derive(Debug)]
+pub struct ServiceLock {
+    path: std::path::PathBuf,
+}
+
+const LOCK_FILE: &str = "b-sandbox.lock";
+
+impl ServiceLock {
+    /// Take the lock. Errors name the live holder; a lock whose pid is dead
+    /// (or unparseable) is removed and re-created.
+    pub fn acquire(data_root: &std::path::Path) -> Result<Self, String> {
+        let path = data_root.join(LOCK_FILE);
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    write!(file, "{}", std::process::id())
+                        .map_err(|e| format!("cannot write lock {path:?}: {e}"))?;
+                    return Ok(Self { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let holder = std::fs::read_to_string(&path)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    match holder.parse::<u32>() {
+                        Ok(pid) if pid != 0 && process_alive(pid) => {
+                            return Err(format!(
+                                "another b-sandbox instance holds {path:?} (pid {pid}); refusing to start"
+                            ));
+                        }
+                        _ => {
+                            tracing::warn!(pid = %holder, "stealing a stale service lock from a dead process");
+                            std::fs::remove_file(&path)
+                                .map_err(|e| format!("cannot remove stale lock {path:?}: {e}"))?;
+                        }
+                    }
+                }
+                Err(e) => return Err(format!("cannot create lock {path:?}: {e}")),
+            }
+        }
+        Err(format!("lock {path:?} is contended"))
+    }
+}
+
+impl Drop for ServiceLock {
+    fn drop(&mut self) {
+        // Best-effort: a leftover file is stolen by the next acquire.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Does `pid` exist right now? `kill(pid, 0)` checks existence without
+/// signaling. The pid file itself excludes our own pid (we only get here on
+/// the AlreadyExists path), and pid 0 is rejected by the caller — it would
+/// mean "our process group", never a real holder.
+fn process_alive(pid: u32) -> bool {
+    // Unix-only service targets.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +196,60 @@ mod tests {
     fn ids_do_not_collide_in_a_small_sample() {
         let set: std::collections::HashSet<String> = (0..256).map(|_| new_sandbox_id()).collect();
         assert_eq!(set.len(), 256, "64-bit ids must not collide in 256 draws");
+    }
+
+    #[test]
+    fn service_lock_excludes_a_second_instance_and_releases_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = ServiceLock::acquire(tmp.path()).unwrap();
+        let err = ServiceLock::acquire(tmp.path()).unwrap_err();
+        assert!(err.contains("pid"), "{err}");
+        // The lock file records the holder's pid.
+        let recorded: u32 = std::fs::read_to_string(tmp.path().join(LOCK_FILE))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(recorded, std::process::id());
+        drop(lock);
+        // Released → acquirable again (and the file is gone afterwards).
+        let again = ServiceLock::acquire(tmp.path()).unwrap();
+        drop(again);
+        assert!(!tmp.path().join(LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn service_lock_steals_a_stale_lock_from_a_dead_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A child we kill and reap: its pid is verifiably gone.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::fs::write(tmp.path().join(LOCK_FILE), pid.to_string()).unwrap();
+        let lock = ServiceLock::acquire(tmp.path()).unwrap();
+        let recorded: u32 = std::fs::read_to_string(tmp.path().join(LOCK_FILE))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(recorded, std::process::id());
+        drop(lock);
+    }
+
+    #[test]
+    fn service_lock_refuses_a_live_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Our own pid is trivially alive.
+        std::fs::write(tmp.path().join(LOCK_FILE), std::process::id().to_string()).unwrap();
+        let err = ServiceLock::acquire(tmp.path()).unwrap_err();
+        assert!(err.contains("refusing"), "{err}");
+        // Garbage content is treated as stale and stolen.
+        std::fs::write(tmp.path().join(LOCK_FILE), "not-a-pid").unwrap();
+        let lock = ServiceLock::acquire(tmp.path()).unwrap();
+        drop(lock);
     }
 }

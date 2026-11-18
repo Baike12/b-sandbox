@@ -468,6 +468,7 @@ dependencies = [
  "async-trait",
  "axum",
  "http-body-util",
+ "libc",
  "sandbox-backend-bwrap",
  "sandbox-backend-seatbelt",
  "sandbox-core",

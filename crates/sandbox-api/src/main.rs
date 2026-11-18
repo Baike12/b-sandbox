@@ -149,6 +149,39 @@ fn build_backend(cfg: &Config) -> Result<Arc<dyn SandboxBackend>, String> {
     }
 }
 
+/// Resolve when SIGINT or SIGTERM arrives (`docker stop` sends SIGTERM).
+/// Then: flip the shutdown flag (SSE tails end their streams), terminate
+/// every live sandbox through the shared removal path, and return — axum
+/// drains the remaining connections and serve() exits.
+async fn shutdown_signal(state: sandbox_api::state::SharedState) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install ctrl_c handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    state
+        .shutdown
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!("shutdown signal received; terminating sandboxes and draining");
+    let ids: Vec<String> = state.registry.read().unwrap().keys().cloned().collect();
+    let terminated = sandbox_api::reaper::terminate_all(&state, &ids, "server_shutdown").await;
+    tracing::info!(count = terminated, "all live sandboxes terminated");
+}
+
 fn main() {
     let cfg = parse_args();
     match (&cfg.egress_proxy, &cfg.egress_credentials) {
@@ -164,6 +197,10 @@ fn main() {
         let reason = health.reason.as_deref().unwrap_or("unknown");
         panic!("backend {:?} unavailable: {reason}", backend.name());
     }
+    // Single instance per data root: two processes would reap each other's
+    // sandboxes as orphans. A stale lock (dead pid) is stolen automatically.
+    let _service_lock =
+        sandbox_api::state::ServiceLock::acquire(&cfg.data_root).unwrap_or_else(|e| panic!("{e}"));
     tracing::info!(
         backend = backend.name(),
         version = env!("CARGO_PKG_VERSION"),
@@ -177,21 +214,37 @@ fn main() {
         sandbox_api::state::AppState::new(backend, cfg.data_root.clone())
             .with_auth_token(cfg.auth_token),
     );
-    // Idle-TTL reaper: terminates sandboxes whose declared TTL elapsed.
-    sandbox_api::reaper::spawn(state.clone());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
     runtime.block_on(async move {
+        // Crash recovery first: stale rootfs directories from a previous
+        // process are removed before anything can observe them.
+        let orphans = sandbox_api::reaper::recover_orphans(&cfg.data_root).await;
+        if orphans > 0 {
+            tracing::warn!(
+                count = orphans,
+                "removed orphaned sandbox directories from the previous run"
+            );
+        }
+        state.metrics.add_orphans_removed(orphans as u64);
+
+        // Idle-TTL reaper: terminates sandboxes whose declared TTL elapsed.
+        // (Inside the runtime — tokio::spawn requires a running executor.)
+        sandbox_api::reaper::spawn(state.clone());
+
         if let (Some(addr), Some(cred_file)) = (&cfg.egress_proxy, &cfg.egress_credentials) {
             start_egress_proxy(addr, cred_file).await;
         }
         let listener = tokio::net::TcpListener::bind((cfg.bind, cfg.port))
             .await
             .unwrap_or_else(|e| panic!("cannot bind {}:{}: {e}", cfg.bind, cfg.port));
-        axum::serve(listener, sandbox_api::routes::router(state))
+        tracing::info!(bind = %cfg.bind, port = cfg.port, "listening");
+        axum::serve(listener, sandbox_api::routes::router(state.clone()))
+            .with_graceful_shutdown(shutdown_signal(state))
             .await
             .expect("server error");
+        tracing::info!("server drained; exiting");
     });
 }

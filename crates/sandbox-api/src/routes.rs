@@ -387,6 +387,7 @@ async fn create_sandbox(
         .write()
         .unwrap()
         .insert(id.clone(), record.clone());
+    tracing::info!(sandbox = %id, "sandbox created");
     if let Some(key) = idempotency_key(&headers) {
         state
             .idempotency
@@ -475,6 +476,7 @@ pub(crate) async fn remove_sandbox(state: &SharedState, id: &str, reason: &str) 
     state.metrics.inc_sandboxes_terminated();
     state.backend.stop(&record.ctx).await?;
     state.backend.deprovision(&record.ctx).await?;
+    tracing::info!(sandbox = %id, reason, "sandbox terminated");
     Ok(())
 }
 
