@@ -112,16 +112,16 @@ async fn send(
 /// machine, release-less debug build); budget is ~10x for CI noise.
 #[tokio::test]
 async fn api_lifecycle_cycle_overhead_budget() {
-    let mut app = app();
+    let app = app();
 
     // Warm-up: pay first-request setup costs outside the measurement.
-    let (status, body) = send(&mut app, "POST", "/sandboxes", Some("{}".into())).await;
+    let (status, body) = send(&app, "POST", "/sandboxes", Some("{}".into())).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
     let runs = 200;
     let started = Instant::now();
     for _ in 0..runs {
-        let (status, body) = send(&mut app, "POST", "/sandboxes", Some("{}".into())).await;
+        let (status, body) = send(&app, "POST", "/sandboxes", Some("{}".into())).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
             .as_str()
@@ -129,7 +129,7 @@ async fn api_lifecycle_cycle_overhead_budget() {
             .to_string();
 
         let (status, _) = send(
-            &mut app,
+            &app,
             "POST",
             &format!("/sandboxes/{id}/exec"),
             Some(r#"{"command":"true"}"#.into()),
@@ -137,10 +137,10 @@ async fn api_lifecycle_cycle_overhead_budget() {
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        let (status, _) = send(&mut app, "GET", &format!("/sandboxes/{id}"), None).await;
+        let (status, _) = send(&app, "GET", &format!("/sandboxes/{id}"), None).await;
         assert_eq!(status, StatusCode::OK);
 
-        let (status, _) = send(&mut app, "DELETE", &format!("/sandboxes/{id}"), None).await;
+        let (status, _) = send(&app, "DELETE", &format!("/sandboxes/{id}"), None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
     let per_cycle_ms = started.elapsed().as_millis() as f64 / runs as f64;
@@ -159,8 +159,8 @@ async fn api_lifecycle_cycle_overhead_budget() {
 /// fails loudly.
 #[tokio::test]
 async fn api_parallel_cycles_throughput_budget() {
-    let mut app = app();
-    let (status, _) = send(&mut app, "POST", "/sandboxes", Some("{}".into())).await;
+    let app = app();
+    let (status, _) = send(&app, "POST", "/sandboxes", Some("{}".into())).await;
     assert_eq!(status, StatusCode::CREATED);
 
     const WORKERS: usize = 16;

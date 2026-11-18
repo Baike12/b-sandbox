@@ -245,9 +245,7 @@ async fn bench_file_data_plane_ops() {
             &app,
             "POST",
             &format!("/sandboxes/{id}/files/write"),
-            Some(
-                serde_json::json!({"path": format!("f/{i}.txt"), "content": payload}).to_string(),
-            ),
+            Some(serde_json::json!({"path": format!("f/{i}.txt"), "content": payload}).to_string()),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
