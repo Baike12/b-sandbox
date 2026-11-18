@@ -15,6 +15,7 @@ sandbox-backend-bwrap = { path = "../sandbox-backend-bwrap" }
 sandbox-egress-proxy = { path = "../sandbox-egress-proxy" }
 axum = { workspace = true }
 libc = { workspace = true }
+tower-http = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 serde = { workspace = true }

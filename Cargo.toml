@@ -31,6 +31,7 @@ hyper = "1"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", default-features = false, features = ["catch-panic"] }
 
 [profile.release]
 lto = true

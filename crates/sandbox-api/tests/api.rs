@@ -25,6 +25,9 @@ use sandbox_core::{
 struct MockBackend {
     data_root: PathBuf,
     available: bool,
+    /// When set, exec panics — proving the panic-catch layer turns a handler
+    /// panic into an envelope 500 instead of a dead connection.
+    panic_on_exec: bool,
 }
 
 impl MockBackend {
@@ -38,6 +41,7 @@ impl MockBackend {
         Self {
             data_root,
             available: true,
+            panic_on_exec: false,
         }
     }
 
@@ -45,6 +49,15 @@ impl MockBackend {
         Self {
             data_root: std::env::temp_dir(),
             available: false,
+            panic_on_exec: false,
+        }
+    }
+
+    fn panicking_on_exec(data_root: PathBuf) -> Self {
+        Self {
+            data_root,
+            available: true,
+            panic_on_exec: true,
         }
     }
 }
@@ -104,6 +117,9 @@ impl SandboxBackend for MockBackend {
         req: ExecRequest,
     ) -> sandbox_core::Result<ExecOutcome> {
         req.validate()?;
+        if self.panic_on_exec {
+            panic!("backend exploded mid-exec");
+        }
         Ok(ExecOutcome {
             exit_code: Some(0),
             timed_out: false,
@@ -135,10 +151,10 @@ fn app_with_state(backend: MockBackend) -> (axum::Router, Arc<AppState>) {
     // The router owns the state; leak the tempdir so data outlives the test
     // (tests are short-lived; this keeps the helper signature simple).
     std::mem::forget(tmp);
-    let backend = if backend.available {
-        MockBackend::available_in(data_root.clone())
-    } else {
-        MockBackend::unavailable()
+    let backend = MockBackend {
+        data_root: data_root.clone(),
+        available: backend.available,
+        panic_on_exec: backend.panic_on_exec,
     };
     let state = Arc::new(AppState::new(Arc::new(backend), data_root));
     (router(state.clone()), state)
@@ -817,6 +833,55 @@ async fn http_metrics_follow_the_full_traffic_picture() {
     // being rendered — deterministic under oneshot, and self-observation
     // matches what a real Prometheus scrape sees.
     assert!(text.contains("bsandbox_http_in_flight 1"), "{text}");
+}
+
+// ---------- limits and panic guard ----------
+
+#[tokio::test]
+async fn oversized_body_is_a_413_envelope() {
+    let app = app(MockBackend::available());
+    let (app, id) = create_sandbox(app).await;
+
+    // 9 MiB of content in one write: over the declared ceiling.
+    let big = "x".repeat(9 * 1024 * 1024);
+    let (status, body) = call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/files/write"),
+        Some(json!({"path": "big.txt", "content": big})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "payload_too_large");
+
+    // The sandbox itself is unharmed: normal writes still work.
+    let (status, _) = call(
+        app,
+        "POST",
+        &format!("/sandboxes/{id}/files/write"),
+        Some(json!({"path": "ok.txt", "content": "fine"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// A handler panic must degrade to the internal envelope on that one
+/// connection — never a dead socket, never a process crash.
+#[tokio::test]
+async fn handler_panic_returns_the_internal_envelope() {
+    let app = app(MockBackend::panicking_on_exec(std::env::temp_dir()));
+    let (app, id) = create_sandbox(app).await;
+
+    let (status, body) = call(
+        app,
+        "POST",
+        &format!("/sandboxes/{id}/exec"),
+        Some(json!({"command": "echo"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["code"], "internal");
+    assert_eq!(body["error"]["message"], "internal error");
 }
 
 #[tokio::test]

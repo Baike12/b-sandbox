@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{MethodRouter, delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -84,13 +85,55 @@ pub fn router(state: SharedState) -> Router {
             state.clone(),
             auth_middleware,
         ))
-        // Outermost: observe sees even auth rejections and unmatched paths,
-        // so the metrics picture is complete traffic, not just successes.
+        // Outermost observing layer: observe sees even auth rejections and
+        // unmatched paths, so the metrics picture is complete traffic.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             observe_middleware,
         ))
+        .layer(axum::middleware::from_fn(body_limit_middleware))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        // Outermost guard: a handler panic must degrade to an envelope 500
+        // on that one connection, not a dead socket.
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            panic_envelope,
+        ))
         .with_state(state)
+}
+
+/// Request-body ceiling: `Content-Length` above this is answered 413 before
+/// any bytes are read. Chunked bodies fall through to the extractor-level
+/// DefaultBodyLimit, which the JSON envelope maps to the same 413.
+pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+async fn body_limit_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let too_big = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| len > MAX_BODY_BYTES);
+    if too_big {
+        return crate::error::payload_too_large().into_response();
+    }
+    next.run(req).await
+}
+
+/// Panic catcher: log the payload server-side, answer the fixed internal
+/// envelope. The code matches `Error::Internal`'s — one internal vocabulary.
+fn panic_envelope(err: Box<dyn std::any::Any + Send>) -> axum::response::Response {
+    let detail = if let Some(s) = err.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    };
+    tracing::error!(panic = %detail, "handler panicked; returning 500");
+    crate::error::internal_panic().into_response()
 }
 
 /// Bearer-token gate. Open when no token is configured; `/health` stays

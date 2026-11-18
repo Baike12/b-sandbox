@@ -87,6 +87,26 @@ pub fn backend_unavailable(reason: &str) -> ApiError {
     }
 }
 
+/// A 413 for request bodies over the declared limit. The envelope code is
+/// registry-stable so clients can branch on it like any other error.
+pub fn payload_too_large() -> ApiError {
+    ApiError {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        code: "payload_too_large",
+        message: "request body exceeds the size limit".into(),
+    }
+}
+
+/// The 500 the panic-catch layer returns. The code is the same `internal`
+/// the domain model uses — one internal-error vocabulary, two entry points.
+pub fn internal_panic() -> ApiError {
+    ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "internal",
+        message: "internal error".into(),
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = serde_json::json!({
@@ -118,11 +138,17 @@ where
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(ApiError {
-                status: StatusCode::BAD_REQUEST,
-                code: "policy_validation",
-                message: rejection.body_text(),
-            }),
+            Err(rejection) => {
+                if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    Err(payload_too_large())
+                } else {
+                    Err(ApiError {
+                        status: StatusCode::BAD_REQUEST,
+                        code: "policy_validation",
+                        message: rejection.body_text(),
+                    })
+                }
+            }
         }
     }
 }

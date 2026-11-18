@@ -122,7 +122,12 @@ fn domain_error_codes() -> Vec<&'static str> {
 }
 
 fn registry_error_codes() -> Vec<&'static str> {
-    vec!["sandbox_not_found", "backend_unavailable", "unauthorized"]
+    vec![
+        "sandbox_not_found",
+        "backend_unavailable",
+        "unauthorized",
+        "payload_too_large",
+    ]
 }
 
 #[test]

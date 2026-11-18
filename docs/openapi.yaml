@@ -15,7 +15,7 @@ info:
     Isolated environments for untrusted agent workloads: declarative
     fs/net/exec policy, per-sandbox budget and usage ledger, idle-TTL
     reaping, pause/resume lifecycle. E2B-compatible where it costs nothing.
-  version: 0.2.0
+  version: 0.3.0
 servers:
   - url: /
 tags:
@@ -609,3 +609,4 @@ components:
       - sandbox_not_found
       - backend_unavailable
       - unauthorized
+      - payload_too_large
