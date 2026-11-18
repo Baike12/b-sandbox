@@ -573,9 +573,16 @@ async fn proxy_mode_egress_goes_through_the_credential_proxy() {
         "127.0.0.1".to_string(),
         "Bearer tok-123".to_string(),
     )]));
-    let proxy = sandbox_egress_proxy::spawn("127.0.0.1:0", creds)
-        .await
-        .unwrap();
+    // AllowAll: this test's upstream intentionally lives on loopback. The
+    // production default (DenyPrivate) is proven in the egress-proxy crate
+    // (deny_private_blocks_* tests).
+    let proxy = sandbox_egress_proxy::spawn_with_policy(
+        "127.0.0.1:0",
+        creds,
+        sandbox_egress_proxy::EgressPolicy::AllowAll,
+    )
+    .await
+    .unwrap();
 
     let (backend, _tmp) = fresh_backend().await;
     let backend = backend.with_egress_proxy(proxy.to_string());

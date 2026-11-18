@@ -13,12 +13,22 @@
 //!   inject into it — HTTPS credentials belong in exec env vars, never in
 //!   this proxy's table (documented posture, not a TODO).
 //!
+//! Egress is policy-filtered (`EgressPolicy`): the default refuses loopback,
+//! link-local, RFC1918/CGNAT, unique-local, and other reserved destinations,
+//! because the proxy runs unconfined on the host — without the filter, the
+//! sandbox's one loopback hole would be a tunnel into every host-side
+//! service (databases, this API itself) and cloud metadata. DNS names are
+//! resolved and checked before connecting; a name resolving to any blocked
+//! address is refused outright (rebinding defense).
+//!
 //! The proxy runs on the host loopback next to the sandbox service; the
 //! backend's network policy opens exactly one hole: this endpoint.
 
 use std::collections::BTreeMap;
 use std::io;
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -26,17 +36,42 @@ use tokio::net::{TcpListener, TcpStream};
 /// Upper bound on a request head; a bigger head is a protocol error.
 pub const MAX_HEAD_BYTES: usize = 16 * 1024;
 
+/// Outbound connect budget: a dead upstream must fail fast enough that the
+/// sandboxed client's own timeout governs, and a hung connect must not pin
+/// a proxy connection slot forever.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// host (lowercase, no port) → Authorization header value.
 pub type Credentials = Arc<BTreeMap<String, String>>;
+
+/// Where the proxy may egress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EgressPolicy {
+    /// Public internet only (see the module docs). The production default.
+    #[default]
+    DenyPrivate,
+    /// No destination filtering — for tests and for deployments that
+    /// deliberately proxy to internal services.
+    AllowAll,
+}
 
 /// Accept loop. Returns on listener error; per-connection errors are logged,
 /// never crash the proxy.
 pub async fn serve(listener: TcpListener, credentials: Credentials) -> io::Result<()> {
+    serve_with_policy(listener, credentials, EgressPolicy::DenyPrivate).await
+}
+
+/// [`serve`] with an explicit egress policy.
+pub async fn serve_with_policy(
+    listener: TcpListener,
+    credentials: Credentials,
+    policy: EgressPolicy,
+) -> io::Result<()> {
     loop {
         let (conn, _peer) = listener.accept().await?;
         let creds = credentials.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(conn, creds).await {
+            if let Err(e) = handle(conn, creds, policy).await {
                 tracing::warn!(error = %e, "egress-proxy connection dropped");
             }
         });
@@ -45,13 +80,30 @@ pub async fn serve(listener: TcpListener, credentials: Credentials) -> io::Resul
 
 /// Bind and serve on `addr`; returns the bound address (for port 0 tests).
 pub async fn spawn(addr: &str, credentials: Credentials) -> io::Result<std::net::SocketAddr> {
+    spawn_with_policy(addr, credentials, EgressPolicy::DenyPrivate).await
+}
+
+/// [`spawn`] with an explicit egress policy.
+pub async fn spawn_with_policy(
+    addr: &str,
+    credentials: Credentials,
+    policy: EgressPolicy,
+) -> io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    tokio::spawn(serve(listener, credentials));
+    tokio::spawn(serve_with_policy(listener, credentials, policy));
     Ok(bound)
 }
 
-async fn handle(mut conn: TcpStream, creds: Credentials) -> io::Result<()> {
+/// Parsed absolute-form request, ready to forward.
+struct ForwardRequest {
+    method: String,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+async fn handle(mut conn: TcpStream, creds: Credentials, policy: EgressPolicy) -> io::Result<()> {
     let head = read_head(&mut conn).await?;
     let text = String::from_utf8_lossy(&head);
     let mut lines = text.split("\r\n");
@@ -61,9 +113,15 @@ async fn handle(mut conn: TcpStream, creds: Credentials) -> io::Result<()> {
     let target = parts.next().unwrap_or_default().to_string();
 
     if method == "CONNECT" {
-        tunnel(conn, &target).await
+        tunnel(conn, &target, policy).await
     } else if let Some((host, port, path)) = parse_absolute_http(&target) {
-        forward(conn, &head, &method, &host, port, &path, &creds).await
+        let req = ForwardRequest {
+            method,
+            host,
+            port,
+            path,
+        };
+        forward(conn, &head, &req, &creds, policy).await
     } else {
         respond(
             &mut conn,
@@ -72,6 +130,62 @@ async fn handle(mut conn: TcpStream, creds: Credentials) -> io::Result<()> {
         )
         .await
     }
+}
+
+/// Resolve `host` and connect with the egress policy applied. Every resolved
+/// address is checked: a host resolving to any blocked address fails the
+/// whole connect (no fall-through to a public address — that is the DNS
+/// rebinding defense). Connection attempts are bounded by CONNECT_TIMEOUT.
+async fn connect_checked(host: &str, port: u16, policy: EgressPolicy) -> io::Result<TcpStream> {
+    let addrs = tokio::net::lookup_host((host, port)).await.map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("cannot resolve {host}: {e}"),
+        )
+    })?;
+    let mut last_err: Option<io::Error> = None;
+    for addr in addrs {
+        if let Some(reason) = blocked_reason(addr.ip(), policy) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
+        }
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => last_err = Some(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no usable addresses")))
+}
+
+/// Why this address is unreachable through the proxy, under `policy`.
+fn blocked_reason(ip: IpAddr, policy: EgressPolicy) -> Option<String> {
+    if policy == EgressPolicy::AllowAll {
+        return None;
+    }
+    let blocked = match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_unspecified()
+                || o[0] == 0 // this-network (0.0.0.0/8)
+                || v4.is_private() // RFC1918
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT 100.64/10
+                || (o[0] == 198 && (o[1] & 0xfe) == 18) // benchmarking 198.18/15
+                || v4.is_broadcast()
+                || v4.is_documentation()
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_unspecified()
+                || v6.is_loopback()
+                || (seg[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // documentation
+        }
+    };
+    blocked.then(|| format!("egress to {ip} is denied (private/loopback/link-local ranges are unreachable through this proxy)"))
 }
 
 /// Read until the end of the request head (bounded).
@@ -122,30 +236,37 @@ fn parse_absolute_http(target: &str) -> Option<(String, u16, String)> {
 async fn forward(
     mut client: TcpStream,
     head: &[u8],
-    method: &str,
-    host: &str,
-    port: u16,
-    path: &str,
+    req: &ForwardRequest,
     creds: &Credentials,
+    policy: EgressPolicy,
 ) -> io::Result<()> {
     let text = String::from_utf8_lossy(head);
     let mut head_lines = text.split("\r\n");
     head_lines.next(); // request line, rebuilt below
 
-    let host_header = format!("{host}:{port}");
-    let inject_value = creds.get(host);
-    let mut rewritten = format!("{method} {path} HTTP/1.1\r\n");
+    let host_header = format!("{}:{}", req.host, req.port);
+    let inject_value = creds.get(&req.host);
+    let mut rewritten = format!("{} {} HTTP/1.1\r\n", req.method, req.path);
     let mut has_host = false;
+    // After a stripped header, obs-fold continuation lines (leading SP/HTAB)
+    // must go too — a folded fragment would recombine with the injected
+    // Authorization into a smuggled second header.
+    let mut skip_continuation = false;
     for line in head_lines {
         if line.is_empty() {
             continue;
         }
+        if skip_continuation && (line.starts_with(' ') || line.starts_with('\t')) {
+            continue;
+        }
+        skip_continuation = false;
         let lower = line.to_ascii_lowercase();
         // The proxy owns these headers end-to-end.
         if lower.starts_with("proxy-authorization:")
             || lower.starts_with("proxy-connection:")
             || lower.starts_with("connection:")
         {
+            skip_continuation = true;
             continue;
         }
         if lower.starts_with("authorization:") {
@@ -154,6 +275,8 @@ async fn forward(
             if inject_value.is_none() {
                 rewritten.push_str(line);
                 rewritten.push_str("\r\n");
+            } else {
+                skip_continuation = true;
             }
             continue;
         }
@@ -174,7 +297,10 @@ async fn forward(
     // Keep-alive state is per-connection; both legs close when idle anyway.
     rewritten.push_str("Connection: close\r\n\r\n");
 
-    let mut upstream = TcpStream::connect((host, port)).await?;
+    let mut upstream = match connect_checked(&req.host, req.port, policy).await {
+        Ok(stream) => stream,
+        Err(e) => return respond_for_connect_error(&mut client, &e).await,
+    };
     upstream.write_all(rewritten.as_bytes()).await?;
     upstream.flush().await?;
 
@@ -183,7 +309,10 @@ async fn forward(
 }
 
 /// CONNECT tunnel: TLS stays end-to-end; bytes are copied both ways.
-async fn tunnel(mut client: TcpStream, target: &str) -> io::Result<()> {
+/// Connect failures answer 403 (policy denial) or 502 (unreachable) instead
+/// of dropping the connection — the sandboxed client gets an observable
+/// refusal, and a blocked target never leaves a silent hang.
+async fn tunnel(mut client: TcpStream, target: &str, policy: EgressPolicy) -> io::Result<()> {
     let (host, port) = match target.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
@@ -192,13 +321,27 @@ async fn tunnel(mut client: TcpStream, target: &str) -> io::Result<()> {
         ),
         None => (target.to_string(), 443),
     };
-    let mut upstream = TcpStream::connect((host.as_str(), port)).await?;
+    let mut upstream = match connect_checked(host.as_str(), port, policy).await {
+        Ok(stream) => stream,
+        Err(e) => return respond_for_connect_error(&mut client, &e).await,
+    };
     client
         .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
         .await?;
     client.flush().await?;
     tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     Ok(())
+}
+
+/// 403 for policy denials, 502 for everything else — with the reason as the
+/// error body (IPs and resolution failures carry no secrets).
+async fn respond_for_connect_error(client: &mut TcpStream, e: &io::Error) -> io::Result<()> {
+    let status = if e.kind() == io::ErrorKind::PermissionDenied {
+        "403 Forbidden"
+    } else {
+        "502 Bad Gateway"
+    };
+    respond(client, status, &e.to_string()).await
 }
 
 async fn respond(conn: &mut TcpStream, status: &str, message: &str) -> io::Result<()> {
@@ -211,4 +354,50 @@ async fn respond(conn: &mut TcpStream, status: &str, message: &str) -> io::Resul
     conn.write_all(response.as_bytes()).await?;
     conn.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn v4(octets: [u8; 4]) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(octets))
+    }
+
+    #[test]
+    fn reserved_ranges_are_blocked_under_deny_private() {
+        let cases: Vec<(IpAddr, bool)> = vec![
+            (v4([127, 0, 0, 1]), true),       // loopback
+            (v4([10, 0, 0, 5]), true),        // RFC1918
+            (v4([192, 168, 1, 1]), true),     // RFC1918
+            (v4([172, 16, 0, 9]), true),      // RFC1918
+            (v4([100, 64, 1, 1]), true),      // CGNAT (not is_private)
+            (v4([198, 18, 0, 1]), true),      // benchmarking (not is_private)
+            (v4([169, 254, 169, 254]), true), // cloud metadata
+            (v4([0, 0, 0, 0]), true),         // unspecified
+            (v4([0, 1, 2, 3]), true),         // this-network
+            (v4([8, 8, 8, 8]), false),        // public
+            (v4([1, 1, 1, 1]), false),        // public
+            (IpAddr::V6(Ipv6Addr::LOCALHOST), true),
+            (IpAddr::V6(Ipv6Addr::UNSPECIFIED), true),
+            (IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), true), // unique local
+            (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), true), // link-local
+            (
+                IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x4700)),
+                false,
+            ), // public
+        ];
+        for (ip, want_blocked) in cases {
+            assert_eq!(
+                blocked_reason(ip, EgressPolicy::DenyPrivate).is_some(),
+                want_blocked,
+                "{ip}"
+            );
+            assert!(
+                blocked_reason(ip, EgressPolicy::AllowAll).is_none(),
+                "AllowAll must not filter: {ip}"
+            );
+        }
+    }
 }
