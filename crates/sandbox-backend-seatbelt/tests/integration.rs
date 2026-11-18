@@ -358,8 +358,8 @@ async fn pids_budget_is_visible_in_the_child() {
     let (backend, _tmp) = fresh_backend().await;
     let spec = SandboxSpec {
         budget: sandbox_core::Budget {
-            memory_mb: sandbox_core::budget::Budget::default().memory_mb,
-            pids_max: 64,
+            memory_mb: None,
+            pids_max: Some(64),
         },
         ..Default::default()
     };
@@ -384,8 +384,8 @@ async fn explicit_memory_budget_is_rejected_on_macos_tier() {
     let (backend, _tmp) = fresh_backend().await;
     let spec = SandboxSpec {
         budget: sandbox_core::Budget {
-            memory_mb: 512,
-            pids_max: sandbox_core::budget::Budget::default().pids_max,
+            memory_mb: Some(512),
+            pids_max: None,
         },
         ..Default::default()
     };
@@ -570,7 +570,9 @@ async fn proxy_mode_egress_goes_through_the_credential_proxy() {
     let upstream = spawn_upstream(captured.clone()).await;
 
     let creds = Arc::new(std::collections::BTreeMap::from([(
-        "127.0.0.1".to_string(),
+        // host:port key: credentials are scoped to the exact listener (bare
+        // host keys apply to port 80 only — see credential_for).
+        format!("127.0.0.1:{upstream}"),
         "Bearer tok-123".to_string(),
     )]));
     // AllowAll: this test's upstream intentionally lives on loopback. The
@@ -620,4 +622,221 @@ async fn proxy_mode_egress_goes_through_the_credential_proxy() {
     assert_ne!(denied.exit_code, Some(0));
     assert!(!denied.timed_out);
     assert!(!captured.lock().unwrap().contains("203.0.113.5"));
+}
+
+// ---------- adversarial: termination, rlimit hardening, unix-socket deny ----------
+
+/// A workload that backgrounds its own child (`nohup … &`) must not outlive
+/// its sandbox: before stop() killed the recorded process groups, the child
+/// kept running with its host grants after DELETE (verified escape). The
+/// granted path stops receiving writes once the sandbox terminates.
+#[tokio::test]
+async fn backgrounded_workload_dies_with_its_sandbox() {
+    let (backend, tmp) = fresh_backend().await;
+    // Scratch dir OUTSIDE the sandbox: proof of host access while alive.
+    let witness_dir = tmp.path().join("witness");
+    std::fs::create_dir_all(&witness_dir).unwrap();
+    let witness = witness_dir.join("trace");
+    // Seatbelt evaluates the kernel-resolved path, so the workload must pass
+    // the canonical spelling (macOS /var -> /private/var), exactly like the
+    // existing grant tests.
+    let witness_str = std::fs::canonicalize(&witness_dir)
+        .unwrap()
+        .join("trace")
+        .to_string_lossy()
+        .into_owned();
+
+    let fs = FsPolicy {
+        readwrite: vec![witness_dir.to_string_lossy().into_owned()],
+        ..Default::default()
+    };
+    let ctx = backend
+        .provision("bg-escape", &spec_with_fs(fs))
+        .await
+        .unwrap();
+
+    // Background a writer that appends a line every 100 ms, then exit.
+    let outcome = backend
+        .exec(
+            &ctx,
+            exec_req(
+                "/bin/sh",
+                &[
+                    "-c",
+                    &format!(
+                        "nohup /bin/sh -c 'while true; do echo bg-escape-witness-marker >> {}; sleep 0.1; done' >/dev/null 2>&1 &\nsleep 0.3\nexit 0",
+                        witness_str
+                    ),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.exit_code, Some(0), "{outcome:?}");
+    let before = std::fs::read_to_string(&witness)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert!(before >= 1, "backgrounded writer must have started");
+
+    backend.stop(&ctx).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let after = std::fs::read_to_string(&witness)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(
+        before, after,
+        "no writes may land after stop(): the workload died with its sandbox"
+    );
+    // The process is actually gone. The pattern targets THIS test's witness
+    // path (unique per run) — pgrep is machine-global and the pattern must
+    // not match unrelated processes.
+    let probe = std::process::Command::new("/usr/bin/pgrep")
+        .args(["-f", "bg-escape-witness-marker"])
+        .output()
+        .unwrap();
+    assert!(
+        probe.stdout.is_empty(),
+        "survivor found: {:?}",
+        String::from_utf8_lossy(&probe.stdout)
+    );
+}
+
+/// rlimits are now hard limits (cur == max): a workload cannot restore its
+/// own fd/pid budget with one setrlimit call (verified escape before).
+#[tokio::test]
+async fn pids_ceiling_refuses_a_fork_bomb() {
+    // Enforcement evidence by differential (same probe, two budgets): the
+    // probe backgrounds 64 sleeps and echoes a completion marker. Under the
+    // max ceiling there is headroom and the probe completes; under a small
+    // ceiling the first fork beyond it is refused with EAGAIN. RLIMIT_NPROC
+    // is per-uid and the sandbox shares the service's uid, so the exact
+    // boundary depends on host process noise — the differential below only
+    // needs the probe to fit the max ceiling, which any healthy host has.
+    // (macOS /bin/sh aborts the whole script on a failed background fork —
+    // that abort is itself the observable refusal.)
+    // Backgrounded sleeps redirect BOTH streams away from the exec pipe:
+    // children inherit it, and EOF (what the exec reader waits on) only
+    // arrives when every holder exits — without the redirect the probe
+    // would take the sleep lifetime (60 s) instead of the shell's.
+    let probe = "i=0; while [ $i -lt 64 ]; do sleep 60 >/dev/null 2>&1 & i=$((i+1)); done; echo all-spawned";
+    let (backend, _tmp) = fresh_backend().await;
+
+    let headroom_spec = SandboxSpec {
+        budget: sandbox_core::Budget {
+            memory_mb: None,
+            pids_max: Some(sandbox_core::budget::PIDS_MAX_CEILING),
+        },
+        ..Default::default()
+    };
+    let ctx_ok = backend
+        .provision("fork-headroom", &headroom_spec)
+        .await
+        .unwrap();
+    let ok = backend
+        .exec(&ctx_ok, exec_req("/bin/sh", &["-c", probe]))
+        .await
+        .unwrap();
+    let _ = backend.stop(&ctx_ok).await;
+    let _ = backend.deprovision(&ctx_ok).await;
+    assert!(
+        ok.stdout.contains("all-spawned"),
+        "below the ceiling the probe must complete: stdout={:?} stderr={:?}",
+        ok.stdout,
+        ok.stderr
+    );
+
+    let capped_spec = SandboxSpec {
+        budget: sandbox_core::Budget {
+            memory_mb: None,
+            pids_max: Some(64),
+        },
+        ..Default::default()
+    };
+    let ctx_capped = backend
+        .provision("fork-capped", &capped_spec)
+        .await
+        .unwrap();
+    let capped = backend
+        .exec(&ctx_capped, exec_req("/bin/sh", &["-c", probe]))
+        .await
+        .unwrap();
+    let _ = backend.stop(&ctx_capped).await;
+    let _ = backend.deprovision(&ctx_capped).await;
+    assert!(
+        !capped.stdout.contains("all-spawned"),
+        "the ceiling must stop the probe: stdout={:?}",
+        capped.stdout
+    );
+    assert!(
+        capped.stderr.contains("Resource temporarily unavailable"),
+        "fork refusal (EAGAIN) is the mechanism: stderr={:?}",
+        capped.stderr
+    );
+}
+
+#[tokio::test]
+async fn raising_a_lowered_hard_limit_fails_inside_the_sandbox() {
+    let (backend, _tmp) = fresh_backend().await;
+    let ctx = backend
+        .provision("rlimit-escape", &SandboxSpec::default())
+        .await
+        .unwrap();
+    // /bin/sh ulimit -n <bigger> must fail: the hard limit no longer allows it.
+    let outcome = backend
+        .exec(&ctx, exec_req("/bin/sh", &["-c", "ulimit -n 65536"]))
+        .await
+        .unwrap();
+    assert_ne!(
+        outcome.exit_code,
+        Some(0),
+        "raising the hard limit must fail inside the sandbox: {outcome:?}"
+    );
+}
+
+/// fs.denied must also cut the AF_UNIX channel: a socket at a denied path
+/// (Docker/ssh-agent style control-plane escape) is unreachable — connect()
+/// is network-outbound from Seatbelt's point of view (MXC parity).
+#[tokio::test]
+async fn denied_path_blocks_unix_socket_connect() {
+    let (backend, tmp) = fresh_backend().await;
+    // Host-side listener at the denied path, created OUTSIDE the sandbox.
+    let sock_path = tmp.path().join("agent.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+    let _ = listener;
+
+    let fs = FsPolicy {
+        denied: vec![sock_path.to_string_lossy().into_owned()],
+        ..Default::default()
+    };
+    let ctx = backend
+        .provision("unix-deny", &spec_with_fs(fs))
+        .await
+        .unwrap();
+
+    // nc -z -U: exit 0 iff the unix connect succeeded. The connect must be
+    // denied by the denied-path rule, so the workload exits nonzero.
+    let outcome = backend
+        .exec(
+            &ctx,
+            exec_req(
+                "/usr/bin/nc",
+                &[
+                    "-z",
+                    "-U",
+                    &std::fs::canonicalize(sock_path.parent().unwrap())
+                        .unwrap()
+                        .join(sock_path.file_name().unwrap())
+                        .to_string_lossy(),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        outcome.exit_code,
+        Some(0),
+        "connect to a denied-path unix socket must be denied: {outcome:?}"
+    );
 }
