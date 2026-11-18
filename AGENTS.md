@@ -32,26 +32,29 @@ crates/                          Rust workspace
 │   ├── profile.rs               policy → argv (pure fn, unit-tested)
 │   └── tests/integration.rs     linux-gated; runs only where bwrap exists
 ├── sandbox-api/                 axum REST service (lib + thin bin in main.rs)
-│   ├── routes.rs                route table (single source) + lifecycle/exec/files handlers
+│   ├── routes.rs                route table (single source) + lifecycle/exec/files handlers +
+│   │                            observe/body-limit middleware + route→pattern normalization
 │   ├── ledger.rs                per-sandbox usage accounting (exec/file ops)
-│   ├── reaper.rs                idle-TTL sweep (pure query + shared termination path)
-│   ├── metrics.rs               Prometheus text format, hand-rolled, lock-free
+│   ├── reaper.rs                idle-TTL sweep + startup orphan recovery + bulk termination
+│   ├── metrics.rs               Prometheus text format (counters, per-route histograms, gauges)
 │   ├── files.rs                 sandbox-relative path resolution (traversal +
 │   │                            symlink escapes are policy_validation errors)
-│   ├── state.rs                 registry (Arc records), id minting, idempotency
-│   ├── error.rs                 code→status mapping, ApiJson envelope extractor
+│   ├── state.rs                 registry (Arc records), id minting, idempotency,
+│   │                            ServiceLock (single instance per data root)
+│   ├── error.rs                 code→status mapping, ApiJson envelope extractor,
+│   │                            panic/413 envelope helpers
 │   └── b64.rs                   local base64 (one function, no dependency)
-docs/                            design docs and RFCs (design.md 中文, plan.md English)
+docs/                            design docs and RFCs (design.md 中文, plan.md English);
+│                                production-readiness.md + production-report.md (中文)
 vendor/                          reference open-source sandboxes — read-only, see vendor/README.md
 scripts/gate.sh                  fmt + clippy -D warnings + test --workspace
+scripts/bench.sh                 release-binary resource/latency table (RSS, HTTP, Seatbelt exec)
 deploy/                          Dockerfile, compose.yaml, nginx snippet, server_setup/remote_run
 scripts/deploy.sh                cross-compile (musl/zig) → scp → server docker build → compose up
 crates/sandbox-egress-proxy/     credential-injection egress proxy (lib + standalone bin);
                                  net.proxy sandboxes get one loopback hole + proxy env vars
 crates/sandbox-sdk/              typed Rust client; live-TCP tests against the real router
-docs/openapi.yaml                versioned API contract; tests/contract.rs locks routes+codes
-deploy/                          Dockerfile, compose.yaml, nginx snippet, server_setup/remote_run
-scripts/deploy.sh                cross-compile (musl/zig) → scp → server docker build → compose up
+docs/openapi.yaml                versioned API contract (v0.3.0); tests/contract.rs locks routes+codes
 web/                             not yet (M3+: console)
 ```
 

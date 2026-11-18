@@ -130,3 +130,24 @@ code without enforcement evidence was written; the design is complete and
 the adversarial acceptance suite is already specified.
 
 Recorded but deferred further: cgroups-v2 memory enforcement for bwrap (needs Linux host evidence; capability bit stays undeclared until a test proves enforcement), e2b SDK driver over the API (envd-protocol bridge belongs with the M3 microVM in-guest agent).
+
+## 8. Production-readiness hardening round (2026-11-19)
+
+Status: **landed.** Driven by a standards study (docs/production-readiness.md:
+24 standards distilled from vendor/cubesandbox, vendor/e2b, vendor/mxc,
+vendor/microsandbox plus web research) and verified in
+docs/production-report.md. Gate: 23 suites / 197 tests green.
+
+| Change | Ships | Done when |
+| --- | --- | --- |
+| Observability middleware | structured logs (tracing, `B_SANDBOX_LOG`), full-traffic HTTP metrics with route-pattern normalization (bounded cardinality), per-route + exec latency histograms, in-flight gauges | `http_metrics_follow_the_full_traffic_picture`; scrape cost ~99 µs |
+| SSE lifecycle closure | streams end when their sandbox terminates (terminated event delivered first — event-before-transition ordering) or on server drain; one gauge slot per stream | `sse_stream_ends_after_its_sandbox_terminates`, `sse_stream_ends_when_the_server_drains` |
+| Graceful shutdown + crash recovery | SIGTERM/SIGINT → terminate all sandboxes via the shared path → SSE closure → axum drain; startup orphan sweep; ServiceLock pid-file (stale locks stolen) | real-binary smoke: SIGTERM → `all live sandboxes terminated count=1` → `server drained` |
+| Panic guard + body limit | CatchPanicLayer → internal envelope 500 on one connection; 8 MiB ceiling with `payload_too_large` envelope (spec 0.3.0) | `handler_panic_returns_the_internal_envelope`, `oversized_body_is_a_413_envelope` |
+| Benchmarks | tests/bench.rs (6 ignored benches) + scripts/bench.sh (release RSS/latency table) + calibrated parallel-throughput gate | RSS 3.1 MB idle / 4.5 MB @20 sandboxes; exec p50 8.3 ms p99 19.5 ms |
+| Fixed real bugs | reaper::spawn before runtime (binary startup panic); SSE termination-event race; observe layer outside auth; plain-text 413 breaking the envelope | each closed by a test, listed in production-report.md §6 |
+
+Deferred (honest): microVM tier (needs Linux + /dev/kvm), per-key rate
+limiting, log shipping (stderr collection is the deployment contract),
+restart persistence (orphans are reclaimed by design until the M3 snapshot
+layer exists).
