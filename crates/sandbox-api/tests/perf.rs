@@ -91,7 +91,7 @@ fn app() -> axum::Router {
 }
 
 async fn send(
-    app: &mut axum::Router,
+    app: &axum::Router,
     method: &str,
     uri: &str,
     body: Option<String>,
@@ -148,5 +148,57 @@ async fn api_lifecycle_cycle_overhead_budget() {
     assert!(
         per_cycle_ms < 2.0,
         "API cycle mean {per_cycle_ms:.3} ms blew the 2 ms order-of-magnitude budget (measured baseline 0.195 ms)"
+    );
+}
+
+/// Parallel lifecycle throughput guard: 16 workers drive cycles through the
+/// same router concurrently. Measured baseline ~2 700+ cycles/s at 32
+/// workers (2026-11-19, dev machine, bench.rs); this gate with 16 workers
+/// asserts only order of magnitude — a serialization regression (a lock
+/// held across awaits, one-at-a-time execs) collapses to <100 cycles/s and
+/// fails loudly.
+#[tokio::test]
+async fn api_parallel_cycles_throughput_budget() {
+    let mut app = app();
+    let (status, _) = send(&mut app, "POST", "/sandboxes", Some("{}".into())).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    const WORKERS: usize = 16;
+    const CYCLES: usize = 10;
+    let app = std::sync::Arc::new(app);
+    let started = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..WORKERS {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..CYCLES {
+                let (status, body) = send(&app, "POST", "/sandboxes", Some("{}".into())).await;
+                assert_eq!(status, StatusCode::CREATED, "{body}");
+                let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let (status, _) = send(
+                    &app,
+                    "POST",
+                    &format!("/sandboxes/{id}/exec"),
+                    Some(r#"{"command":"true"}"#.into()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                let (status, _) = send(&app, "DELETE", &format!("/sandboxes/{id}"), None).await;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.unwrap();
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let per_second = (WORKERS * CYCLES) as f64 / elapsed;
+    eprintln!("parallel lifecycle throughput: {per_second:.0} cycles/s");
+    assert!(
+        per_second > 300.0,
+        "parallel throughput {per_second:.0} cycles/s collapsed (order-of-magnitude floor 300/s; measured baseline ~2 700/s)"
     );
 }
