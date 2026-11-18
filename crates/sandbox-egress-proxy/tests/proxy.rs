@@ -29,11 +29,35 @@ async fn spawn_upstream(captured: Arc<std::sync::Mutex<String>>) -> u16 {
             };
             let captured = captured.clone();
             tokio::spawn(async move {
+                // Read until the request is complete: head + Content-Length
+                // body. A single read would race the proxy's two writes
+                // (rewritten head, then body bytes that rode in with it).
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 2048];
-                // One read is enough for these tiny test requests.
-                let n = conn.read(&mut chunk).await.unwrap();
-                buf.extend_from_slice(&chunk[..n]);
+                let complete = |buf: &[u8]| -> bool {
+                    let text = String::from_utf8_lossy(buf);
+                    let Some(idx) = text.find("\r\n\r\n") else {
+                        return false;
+                    };
+                    let len = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    text.len() >= idx + 4 + len
+                };
+                loop {
+                    if complete(&buf) {
+                        break;
+                    }
+                    match conn.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
                 *captured.lock().unwrap() = String::from_utf8_lossy(&buf).to_string();
                 let body = "proxy-ok";
                 conn.write_all(
@@ -74,8 +98,10 @@ async fn injects_authorization_for_configured_hosts() {
     let captured = Arc::new(std::sync::Mutex::new(String::new()));
     let upstream_port = spawn_upstream(captured.clone()).await;
 
+    // host:port key: credentials are scoped to the exact listener (a bare
+    // host key would only apply to port 80).
     let creds = Arc::new(BTreeMap::from([(
-        "127.0.0.1".to_string(),
+        format!("127.0.0.1:{upstream_port}"),
         "Bearer tok-123".to_string(),
     )]));
     let proxy = spawn_allow_all(creds.as_ref().clone()).await;
@@ -250,4 +276,68 @@ async fn allow_all_still_serves_loopback_targets() {
     )
     .await;
     assert!(response.contains("proxy-ok"), "{response}");
+}
+
+/// A space-before-colon Authorization line is still an Authorization header
+/// upstream; it must be stripped when injecting, not smuggled alongside.
+#[tokio::test]
+async fn request_body_bytes_stay_body_not_headers() {
+    // read_head's chunking rarely aligns with the header terminator: body
+    // bytes arriving in the same segment must be forwarded verbatim, never
+    // re-parsed as header lines (a POST body saying `Authorization: …` is
+    // otherwise a smuggling channel).
+    let captured = Arc::new(std::sync::Mutex::new(String::new()));
+    let upstream_port = spawn_upstream(captured.clone()).await;
+    let proxy = spawn_allow_all(BTreeMap::new()).await;
+
+    let body = "Authorization: smuggled\r\nhello";
+    let request = format!(
+        "POST http://127.0.0.1:{upstream_port}/x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut conn = TcpStream::connect(&proxy).await.unwrap();
+    conn.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        conn.read_to_end(&mut buf),
+    )
+    .await
+    .expect("upstream response in time");
+    assert!(String::from_utf8_lossy(&buf).contains("proxy-ok"));
+
+    let seen = captured.lock().unwrap().clone();
+    let (head, rest) = seen.split_once("\r\n\r\n").expect("head/body separator");
+    assert!(
+        !head.contains("smuggled"),
+        "body line rode into the head: {head}"
+    );
+    assert!(
+        rest.contains("Authorization: smuggled\r\nhello"),
+        "body must be forwarded verbatim, got {rest:?}"
+    );
+}
+
+#[tokio::test]
+async fn injecting_host_strips_space_colon_smuggled_authorization() {
+    let captured = Arc::new(std::sync::Mutex::new(String::new()));
+    let upstream_port = spawn_upstream(captured.clone()).await;
+
+    let creds = Arc::new(BTreeMap::from([(
+        format!("127.0.0.1:{upstream_port}"),
+        "Bearer real".to_string(),
+    )]));
+    let proxy = spawn_allow_all(creds.as_ref().clone()).await;
+
+    let (_, response) = raw_get(
+        &proxy,
+        &format!("http://127.0.0.1:{upstream_port}/z"),
+        "Host: 127.0.0.1\r\nAuthorization : attacker-value\r\n",
+    )
+    .await;
+
+    assert!(response.contains("proxy-ok"), "{response}");
+    let seen = captured.lock().unwrap().clone();
+    assert!(seen.contains("Authorization: Bearer real\r\n"), "{seen}");
+    assert!(!seen.contains("attacker-value"), "{seen}");
 }

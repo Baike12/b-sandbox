@@ -36,6 +36,15 @@ use tokio::net::{TcpListener, TcpStream};
 /// Upper bound on a request head; a bigger head is a protocol error.
 pub const MAX_HEAD_BYTES: usize = 16 * 1024;
 
+/// Deadline for reading the request head: a client that opens a socket and
+/// never speaks must not hold a connection (and a semaphore slot) forever.
+pub const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Concurrent-connection ceiling. Each in-flight connection holds tasks and
+/// buffers; past this the proxy refuses work instead of growing without
+/// bound — the same fail-closed posture as the API body limit.
+pub const MAX_CONNECTIONS: usize = 1024;
+
 /// Outbound connect budget: a dead upstream must fail fast enough that the
 /// sandboxed client's own timeout governs, and a hung connect must not pin
 /// a proxy connection slot forever.
@@ -67,10 +76,23 @@ pub async fn serve_with_policy(
     credentials: Credentials,
     policy: EgressPolicy,
 ) -> io::Result<()> {
+    let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let (conn, _peer) = listener.accept().await?;
+        let (mut conn, _peer) = listener.accept().await?;
+        // try_acquire, not acquire: an at-capacity proxy must refuse new work
+        // immediately (observable 503) instead of queueing unboundedly.
+        let permit = match capacity.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!("egress-proxy at capacity; refusing connection");
+                let _ = respond(&mut conn, "503 Service Unavailable", "proxy at capacity").await;
+                continue;
+            }
+        };
         let creds = credentials.clone();
         tokio::spawn(async move {
+            // Hold the slot for the whole connection lifetime.
+            let _permit = permit;
             if let Err(e) = handle(conn, creds, policy).await {
                 tracing::warn!(error = %e, "egress-proxy connection dropped");
             }
@@ -104,7 +126,7 @@ struct ForwardRequest {
 }
 
 async fn handle(mut conn: TcpStream, creds: Credentials, policy: EgressPolicy) -> io::Result<()> {
-    let head = read_head(&mut conn).await?;
+    let (head, leftover) = read_head(&mut conn).await?;
     let text = String::from_utf8_lossy(&head);
     let mut lines = text.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
@@ -121,7 +143,7 @@ async fn handle(mut conn: TcpStream, creds: Credentials, policy: EgressPolicy) -
             port,
             path,
         };
-        forward(conn, &head, &req, &creds, policy).await
+        forward(conn, &head, &leftover, &req, &creds, policy).await
     } else {
         respond(
             &mut conn,
@@ -163,6 +185,13 @@ fn blocked_reason(ip: IpAddr, policy: EgressPolicy) -> Option<String> {
     if policy == EgressPolicy::AllowAll {
         return None;
     }
+    // IPv4-mapped (and deprecated IPv4-compatible) IPv6 forms dial IPv4 at
+    // connect time: `::ffff:127.0.0.1` is not loopback to Ipv6Addr::is_loopback,
+    // but the kernel dials 127.0.0.1. Policy checks the effective v4 address.
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    };
     let blocked = match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -188,12 +217,24 @@ fn blocked_reason(ip: IpAddr, policy: EgressPolicy) -> Option<String> {
     blocked.then(|| format!("egress to {ip} is denied (private/loopback/link-local ranges are unreachable through this proxy)"))
 }
 
-/// Read until the end of the request head (bounded).
-async fn read_head(conn: &mut TcpStream) -> io::Result<Vec<u8>> {
+/// Read until the end of the request head (bounded, timed out). Returns the
+/// head and the body bytes that arrived in the same TCP segments: a single
+/// read rarely aligns with the header terminator, and re-parsing body bytes
+/// as header lines is a smuggling channel (a `Authorization: …` line inside
+/// a POST body would ride along as a header).
+async fn read_head(conn: &mut TcpStream) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 2048];
     loop {
-        let n = conn.read(&mut chunk).await?;
+        let n = match tokio::time::timeout(HEAD_TIMEOUT, conn.read(&mut chunk)).await {
+            Ok(n) => n?,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "client sent no complete request head in time",
+                ));
+            }
+        };
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -207,8 +248,10 @@ async fn read_head(conn: &mut TcpStream) -> io::Result<Vec<u8>> {
                 "request head too large",
             ));
         }
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            return Ok(buf);
+        if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = buf[..idx + 4].to_vec();
+            let leftover = buf[idx + 4..].to_vec();
+            return Ok((head, leftover));
         }
     }
 }
@@ -232,10 +275,31 @@ fn parse_absolute_http(target: &str) -> Option<(String, u16, String)> {
     Some((host.to_ascii_lowercase(), port, path.to_string()))
 }
 
+/// Header name of a request line, case-normalized: everything before the
+/// first colon, trimmed (an `Authorization : x` line has the same name as a
+/// plain `Authorization: x` to any upstream).
+fn header_name(line: &str) -> &str {
+    line.split(':').next().unwrap_or("").trim()
+}
+
+/// Credential for one (host, port) pair. A `host:port` key matches exactly;
+/// a bare `host` key matches only the default HTTP port 80 — the secret must
+/// not be handed to every listener on the same host.
+fn credential_for<'a>(creds: &'a Credentials, host: &str, port: u16) -> Option<&'a String> {
+    if let Some(value) = creds.get(&format!("{host}:{port}")) {
+        return Some(value);
+    }
+    if port == 80 {
+        return creds.get(host);
+    }
+    None
+}
+
 /// Plain-HTTP forward with credential injection.
 async fn forward(
     mut client: TcpStream,
     head: &[u8],
+    leftover: &[u8],
     req: &ForwardRequest,
     creds: &Credentials,
     policy: EgressPolicy,
@@ -245,7 +309,7 @@ async fn forward(
     head_lines.next(); // request line, rebuilt below
 
     let host_header = format!("{}:{}", req.host, req.port);
-    let inject_value = creds.get(&req.host);
+    let inject_value = credential_for(creds, &req.host, req.port);
     let mut rewritten = format!("{} {} HTTP/1.1\r\n", req.method, req.path);
     let mut has_host = false;
     // After a stripped header, obs-fold continuation lines (leading SP/HTAB)
@@ -260,16 +324,20 @@ async fn forward(
             continue;
         }
         skip_continuation = false;
-        let lower = line.to_ascii_lowercase();
+        // Header name comparison is case-insensitive AND trim-aware: a client
+        // `Authorization : evil` (space before the colon) is still an
+        // Authorization header to the upstream and would ride alongside the
+        // injected one as a smuggling channel.
+        let name = header_name(line).to_ascii_lowercase();
         // The proxy owns these headers end-to-end.
-        if lower.starts_with("proxy-authorization:")
-            || lower.starts_with("proxy-connection:")
-            || lower.starts_with("connection:")
-        {
+        if matches!(
+            name.as_str(),
+            "proxy-authorization" | "proxy-connection" | "connection"
+        ) {
             skip_continuation = true;
             continue;
         }
-        if lower.starts_with("authorization:") {
+        if name == "authorization" {
             // For configured hosts the proxy replaces the header entirely;
             // otherwise the client's own header passes through untouched.
             if inject_value.is_none() {
@@ -280,7 +348,7 @@ async fn forward(
             }
             continue;
         }
-        if lower.starts_with("host:") {
+        if name == "host" {
             has_host = true;
             rewritten.push_str(&format!("Host: {host_header}\r\n"));
             continue;
@@ -302,6 +370,11 @@ async fn forward(
         Err(e) => return respond_for_connect_error(&mut client, &e).await,
     };
     upstream.write_all(rewritten.as_bytes()).await?;
+    // Body bytes that rode in with the head go upstream verbatim, before the
+    // bidirectional relay takes over.
+    if !leftover.is_empty() {
+        upstream.write_all(leftover).await?;
+    }
     upstream.flush().await?;
 
     tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
@@ -345,7 +418,11 @@ async fn respond_for_connect_error(client: &mut TcpStream, e: &io::Error) -> io:
 }
 
 async fn respond(conn: &mut TcpStream, status: &str, message: &str) -> io::Result<()> {
-    let body = format!("{{\"error\":\"{message}\"}}");
+    // serde_json owns the escaping: error text embeds hostnames and OS
+    // messages, and a raw `{message}` in the template would let a crafted
+    // hostname break the JSON envelope or forge response headers.
+    let body = serde_json::to_string(&serde_json::json!({ "error": message }))
+        .unwrap_or_else(|_| "{\"error\":\"internal\"}".to_string());
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -363,6 +440,33 @@ mod policy_tests {
 
     fn v4(octets: [u8; 4]) -> IpAddr {
         IpAddr::V4(Ipv4Addr::from(octets))
+    }
+
+    #[test]
+    fn bare_host_credentials_apply_only_to_port_80() {
+        let creds: Credentials = Arc::new(BTreeMap::from([
+            ("example.com".to_string(), "bare".to_string()),
+            ("exact.example.com:8443".to_string(), "exact".to_string()),
+        ]));
+        assert_eq!(
+            credential_for(&creds, "example.com", 80).map(String::as_str),
+            Some("bare")
+        );
+        assert_eq!(credential_for(&creds, "example.com", 8080), None);
+        assert_eq!(credential_for(&creds, "example.com", 443), None);
+        assert_eq!(
+            credential_for(&creds, "exact.example.com", 8443).map(String::as_str),
+            Some("exact")
+        );
+        assert_eq!(credential_for(&creds, "exact.example.com", 80), None);
+    }
+
+    #[test]
+    fn header_names_are_trimmed_before_comparison() {
+        assert_eq!(header_name("Authorization: x"), "Authorization");
+        assert_eq!(header_name("Authorization : x"), "Authorization");
+        assert_eq!(header_name("\tauthorization:x"), "authorization");
+        assert_eq!(header_name("no-colon"), "no-colon");
     }
 
     #[test]

@@ -40,10 +40,13 @@ fn load_credentials(path: &str) -> BTreeMap<String, String> {
 
 fn main() {
     let cfg = parse_args();
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_env_var("B_SANDBOX_LOG")
+        .with_default_directive("info".parse().expect("valid default directive"))
+        .from_env_lossy();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
     let credentials = Arc::new(load_credentials(&cfg.credentials_path));
