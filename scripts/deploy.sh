@@ -98,6 +98,14 @@ retry scp -o BatchMode=yes -o ConnectTimeout=20 \
 retry scp -o BatchMode=yes -o ConnectTimeout=20 \
   "${BINARY}" "${HOST}:${APP_DIR}/dist/b-sandbox-linux-amd64"
 
+# Ship the console build when one exists (Dockerfile copies console/ into
+# the image; without it the console routes answer 400 with a build hint).
+if [ -d web/dist ]; then
+  echo ">>> ship the web console build"
+  retry ssh -o BatchMode=yes -o ConnectTimeout=20 "${HOST}" "mkdir -p '${APP_DIR}/console'"
+  retry scp -o BatchMode=yes -o ConnectTimeout=20 -r web/dist/. "${HOST}:${APP_DIR}/console/"
+fi
+
 echo ">>> prepare the server and start the compose project"
 retry ssh -o BatchMode=yes -o ConnectTimeout=20 "${HOST}" \
   "cd '${APP_DIR}' && B_SANDBOX_BASE_PATH='${BASE_PATH}' bash server_setup.sh && TAG='${TAG}' bash remote_run.sh"

@@ -17,6 +17,12 @@ COPY dist/b-sandbox-linux-amd64 /app/sandbox-api
 # RUN chmod is the backstop: scp does not preserve the exec bit.
 RUN chmod +x /app/sandbox-api
 
+# Web console build, when one exists in the deploy context (built with
+# `pnpm build` in web/). The API also detects ./web/dist when run from a
+# repo checkout; inside the image the fixed path is authoritative. Without
+# the directory the console routes answer 400 with a build hint.
+COPY console/ /app/console/
+
 USER 10001
 ENV TZ=Asia/Shanghai
 EXPOSE 8094
@@ -31,4 +37,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
 # container IP, not its loopback. The host-side publish address stays
 # 127.0.0.1 (compose), so nginx remains the only facade.
 ENTRYPOINT ["/app/sandbox-api", "--data-root", "/app/data", "--backend", "bwrap", \
-            "--bind", "0.0.0.0", "--port", "8094"]
+            "--bind", "0.0.0.0", "--port", "8094", "--console-dir", "/app/console"]
