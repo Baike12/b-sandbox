@@ -35,13 +35,19 @@ struct Config {
 }
 
 /// Structured logging: `tracing` to stderr, level from `B_SANDBOX_LOG`
-/// (default `info`). Uninitialized subscribers are no-ops, so library tests
-/// stay quiet unless they opt in.
+/// (default `info`) — the variable is ours, not the tracing default
+/// `RUST_LOG`, so operators follow one documented knob. ANSI colors are
+/// disabled: the container log driver captures raw bytes and a scraper
+/// should not need escape-sequence stripping. Uninitialized subscribers are
+/// no-ops, so library tests stay quiet unless they opt in.
 fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_env_var("B_SANDBOX_LOG")
+        .with_default_directive("info".parse().expect("valid default directive"))
+        .from_env_lossy();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
 }

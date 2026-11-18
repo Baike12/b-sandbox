@@ -153,6 +153,41 @@ where
     }
 }
 
+/// Query extractor that maps deserialization failures into the service
+/// error envelope with a 400, mirroring [`ApiJson`] — axum's default query
+/// rejection is plain-text 400, and a client that parses every error as the
+/// envelope must not hit a different shape for the two extractors.
+pub struct ApiQuery<T>(pub T);
+
+impl<T> std::ops::Deref for ApiQuery<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T, S> axum::extract::FromRequestParts<S> for ApiQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "policy_validation",
+                message: rejection.body_text(),
+            }),
+        }
+    }
+}
+
 /// Alias for handler results.
 pub type ApiResult<T> = std::result::Result<T, ApiError>;
 

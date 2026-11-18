@@ -58,7 +58,7 @@ impl UsageLedger {
 
     pub fn record_exec_started(&mut self, now_ms: u64) {
         self.touch(now_ms);
-        self.execs_started += 1;
+        self.execs_started = self.execs_started.saturating_add(1);
     }
 
     pub fn record_exec_outcome(
@@ -70,17 +70,17 @@ impl UsageLedger {
     ) {
         self.touch(now_ms);
         if timed_out {
-            self.execs_timed_out += 1;
+            self.execs_timed_out = self.execs_timed_out.saturating_add(1);
         } else {
-            self.execs_finished += 1;
+            self.execs_finished = self.execs_finished.saturating_add(1);
         }
-        self.exec_wall_ms += wall_ms;
-        self.output_bytes += output_bytes as u64;
+        self.exec_wall_ms = self.exec_wall_ms.saturating_add(wall_ms);
+        self.output_bytes = self.output_bytes.saturating_add(output_bytes as u64);
     }
 
     pub fn record_file_op(&mut self, now_ms: u64) {
         self.touch(now_ms);
-        self.file_ops += 1;
+        self.file_ops = self.file_ops.saturating_add(1);
     }
 }
 

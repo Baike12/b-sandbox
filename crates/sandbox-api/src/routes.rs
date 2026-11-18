@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{MethodRouter, delete, get, post};
@@ -13,7 +13,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::error::{ApiError, ApiJson, ApiResult, backend_unavailable, sandbox_not_found};
+use crate::error::{
+    ApiError, ApiJson, ApiQuery, ApiResult, backend_unavailable, sandbox_not_found,
+};
 use crate::files::resolve_sandbox_path;
 use crate::ledger::now_ms;
 use crate::state::{SandboxRecord, SharedState, new_sandbox_id};
@@ -80,18 +82,20 @@ pub fn router(state: SharedState) -> Router {
         }
         router = router.route(path, merged);
     }
+    // Layer order (later .layer() = outer = runs first):
+    //   catch-panic → body-limit → observe → auth → handlers.
+    // observe MUST sit outside body-limit and the panic guard so 413s and
+    // panic-500s land in the metrics/log picture (full-traffic observability).
     router
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ))
-        // Outermost observing layer: observe sees even auth rejections and
-        // unmatched paths, so the metrics picture is complete traffic.
+        .layer(axum::middleware::from_fn(body_limit_middleware))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             observe_middleware,
         ))
-        .layer(axum::middleware::from_fn(body_limit_middleware))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         // Outermost guard: a handler panic must degrade to an envelope 500
         // on that one connection, not a dead socket.
@@ -182,16 +186,29 @@ async fn observe_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let method = req.method().as_str().to_owned();
+    // Method label from a CLOSED set: hyper accepts arbitrary token methods,
+    // and an unauthenticated client could mint unbounded label values into
+    // the metrics map with raw extensions. Unknown methods collapse to OTHER.
+    let raw_method = label_method(req.method().as_str()).to_owned();
+    // HEAD is served by GET handlers: the metric label attributes it to the
+    // same GET route (a separate HEAD label would split every per-route
+    // histogram into two half-populated series). The access log keeps the
+    // raw verb.
+    let method: &str = if raw_method == "HEAD" {
+        "GET"
+    } else {
+        &raw_method
+    };
     let path = req.uri().path().to_owned();
-    let route = normalize_route(&state.route_patterns, &method, &path);
+    let route = normalize_route(&state.route_patterns, method, &path);
     let started = std::time::Instant::now();
-    state.metrics.http_in_flight_inc();
+    // RAII: a panic unwinding through this middleware must not leak an
+    // in-flight slot (the panic-catch layer runs outside, so no dec after it).
+    let _in_flight = InFlightGauge::new(&state.metrics);
     let response = next.run(req).await;
-    state.metrics.http_in_flight_dec();
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
-    state.metrics.record_http(&method, route, status, elapsed);
+    state.metrics.record_http(method, route, status, elapsed);
     tracing::info!(
         method = %method,
         route = route,
@@ -201,6 +218,37 @@ async fn observe_middleware(
         "request"
     );
     response
+}
+
+/// Closed method vocabulary for the HTTP metric labels.
+fn label_method(raw: &str) -> &'static str {
+    match raw {
+        "GET" => "GET",
+        "POST" => "POST",
+        "DELETE" => "DELETE",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        _ => "OTHER",
+    }
+}
+
+/// Drops the http_in_flight gauge slot when the request future ends (panic
+/// unwind included), so the gauge can never leak.
+struct InFlightGauge<'a>(&'a crate::metrics::Metrics);
+
+impl<'a> InFlightGauge<'a> {
+    fn new(metrics: &'a crate::metrics::Metrics) -> Self {
+        metrics.http_in_flight_inc();
+        Self(metrics)
+    }
+}
+
+impl Drop for InFlightGauge<'_> {
+    fn drop(&mut self) {
+        self.0.http_in_flight_dec();
+    }
 }
 
 /// Map a concrete request path back to its route-table pattern ("unmatched"
@@ -305,7 +353,7 @@ async fn health(State(state): State<SharedState>) -> Json<serde_json::Value> {
 
 async fn metrics(State(state): State<SharedState>) -> impl axum::response::IntoResponse {
     let active = state.registry.read().unwrap().len() as u64;
-    let body = state.metrics.render(active);
+    let body = state.metrics.render(active, env!("CARGO_PKG_VERSION"));
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -405,7 +453,7 @@ async fn create_sandbox(
         ));
     }
 
-    let id = new_sandbox_id();
+    let id = new_sandbox_id()?;
     let ctx = state.backend.provision(&id, &create.spec).await?;
     let record = Arc::new(SandboxRecord::new(ctx, create.timeout_ms));
 
@@ -914,7 +962,7 @@ struct EventsQuery {
 async fn events(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-    Query(query): Query<EventsQuery>,
+    ApiQuery(query): ApiQuery<EventsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let record = state.get(&id).ok_or_else(|| sandbox_not_found(&id))?;
     let events_log = record.events.lock().unwrap();
@@ -922,8 +970,12 @@ async fn events(
     let events: Vec<serde_json::Value> = events_log
         .events_after(after)
         .iter()
-        .map(|e| serde_json::to_value(e).expect("events serialize"))
-        .collect();
+        .map(|e| {
+            serde_json::to_value(e).map_err(|e| {
+                ApiError::from(Error::Internal(format!("event serialization failed: {e}")))
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
     Ok(Json(json!({
         "events": events,
         "lastSeq": events_log.last_seq(),
@@ -957,7 +1009,7 @@ async fn events_stream(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
-    axum::extract::Query(query): axum::extract::Query<EventsStreamQuery>,
+    ApiQuery(query): ApiQuery<EventsStreamQuery>,
 ) -> ApiResult<EventSse> {
     use axum::response::sse::{Event as SseEvent, KeepAlive};
 
@@ -989,9 +1041,36 @@ async fn events_stream(
                     .id(event.seq.to_string())
                     .event(kind)
                     .data(event.data.to_string());
-                if tx.send(Ok(item)).await.is_err() {
-                    // The client disconnected; the record drops with this task.
-                    return;
+                // The channel is bounded (64): a slow client fills it and a
+                // bare `send().await` would block this loop forever — the
+                // shutdown check below never runs and graceful drain wedges.
+                // Racing the send against the shutdown flag keeps the drain
+                // bounded; `biased` polls the send first, so buffered events
+                // are delivered whenever the client can take them and the
+                // shutdown arm only wins while the channel is genuinely
+                // full. On drain the client reconnects with Last-Event-ID
+                // and replays from its cursor.
+                tokio::select! {
+                    biased;
+                    sent = tx.send(Ok(item)) => {
+                        if sent.is_err() {
+                            // The client disconnected; the record drops with this task.
+                            return;
+                        }
+                    }
+                    _ = async {
+                        loop {
+                            if tail_state
+                                .shutdown
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    } => {
+                        return;
+                    }
                 }
             }
             // Only after draining: a terminated sandbox or a draining server
@@ -1013,7 +1092,26 @@ async fn events_stream(
     )
 }
 
+/// Classify a file-op failure. Caller mistakes (wrong path type, invalid
+/// spelling) are 400 `policy_validation`; only real host/pipe faults are 502
+/// `backend_error` — a 502 that a retry with a corrected path would have
+/// avoided is a lie about where the fault lives.
 fn io_error(e: std::io::Error, path: &std::path::Path) -> ApiError {
+    use std::io::ErrorKind;
+    if matches!(
+        e.kind(),
+        ErrorKind::IsADirectory
+            | ErrorKind::NotADirectory
+            | ErrorKind::DirectoryNotEmpty
+            | ErrorKind::InvalidInput
+            | ErrorKind::InvalidFilename
+            | ErrorKind::PermissionDenied
+            | ErrorKind::NotFound
+    ) {
+        return ApiError::from(Error::Policy(format!(
+            "file op on {path:?}: {e} (path type or spelling is the caller's to fix)"
+        )));
+    }
     ApiError::from(Error::Backend {
         kind: sandbox_core::error::BackendFailureKind::Io,
         message: format!("file op on {path:?}: {e}"),

@@ -835,6 +835,21 @@ async fn http_metrics_follow_the_full_traffic_picture() {
     assert!(text.contains("bsandbox_http_in_flight 1"), "{text}");
 }
 
+/// HEAD must be observed under its GET route with a GET label: HEAD is
+/// served by the GET handler, so splitting it into a `HEAD` label would
+/// fragment every per-route histogram into two half-populated series.
+#[tokio::test]
+async fn head_requests_are_counted_under_their_get_route() {
+    let app = app(MockBackend::available());
+    call_raw(app.clone(), "HEAD", "/health").await;
+    let (_, text) = call_raw(app, "GET", "/metrics").await;
+    assert!(
+        text.contains("method=\"GET\",route=\"/health\",code=\"200\""),
+        "HEAD must be counted as its GET route: {text}"
+    );
+    assert!(!text.contains("method=\"HEAD\""), "no HEAD label: {text}");
+}
+
 // ---------- limits and panic guard ----------
 
 #[tokio::test]
@@ -853,6 +868,21 @@ async fn oversized_body_is_a_413_envelope() {
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     assert_eq!(body["error"]["code"], "payload_too_large");
+
+    // The refusal is observable: the observe middleware sits OUTSIDE the
+    // body limit, so the 413 lands in the route counters and latency
+    // histogram (regression: it used to sit inside and silently skip them).
+    let (_, text) = call_raw(app.clone(), "GET", "/metrics").await;
+    assert!(
+        text.contains("route=\"/sandboxes/{id}/files/write\",code=\"413\""),
+        "413 must be counted under its route pattern: {text}"
+    );
+    assert!(
+        text.contains(
+            "bsandbox_http_request_duration_seconds_count{route=\"/sandboxes/{id}/files/write\"}"
+        ),
+        "413 must land in the latency histogram: {text}"
+    );
 
     // The sandbox itself is unharmed: normal writes still work.
     let (status, _) = call(

@@ -179,8 +179,9 @@ impl Metrics {
     }
 
     /// Render the exposition text. `active` is the live sandbox count,
-    /// derived from the registry by the caller.
-    pub fn render(&self, active: u64) -> String {
+    /// derived from the registry by the caller; `version` feeds the
+    /// build_info gauge so restarts are visible in a scrape diff.
+    pub fn render(&self, active: u64, version: &str) -> String {
         fn counter(name: &str, help: &str, value: u64) -> String {
             format!("# HELP {name} {help}.\n# TYPE {name} counter\n{name} {value}\n")
         }
@@ -197,7 +198,7 @@ impl Metrics {
         ));
         out.push_str(&counter(
             "bsandbox_sandboxes_terminated_total",
-            "Total sandboxes terminated since startup (client deletes)",
+            "Total sandboxes terminated since startup (client deletes, reaper, and shutdown all land here; subtract reaped_total for client deletes)",
             load(&self.sandboxes_terminated),
         ));
         out.push_str(&counter(
@@ -219,6 +220,11 @@ impl Metrics {
             "# HELP bsandbox_sandboxes_active Sandboxes currently in the registry.\n\
              # TYPE bsandbox_sandboxes_active gauge\n\
              bsandbox_sandboxes_active {active}\n"
+        ));
+        out.push_str(&format!(
+            "# HELP bsandbox_build_info Service build metadata (version label), always 1.\n\
+             # TYPE bsandbox_build_info gauge\n\
+             bsandbox_build_info{{version=\"{version}\"}} 1\n"
         ));
         out.push_str(&gauge(
             "bsandbox_http_in_flight",
@@ -312,7 +318,7 @@ mod tests {
     #[test]
     fn fresh_metrics_render_zeroes_with_help_and_types() {
         let metrics = Metrics::default();
-        let text = metrics.render(0);
+        let text = metrics.render(0, env!("CARGO_PKG_VERSION"));
         assert!(text.contains("# TYPE bsandbox_sandboxes_created_total counter"));
         assert!(text.contains("bsandbox_sandboxes_created_total 0"));
         assert!(text.contains("# TYPE bsandbox_sandboxes_active gauge"));
@@ -334,7 +340,7 @@ mod tests {
         metrics.record_exec_outcome(true, true, 40);
         metrics.inc_file_ops();
 
-        let text = metrics.render(7);
+        let text = metrics.render(7, "test");
         assert!(
             text.contains("bsandbox_sandboxes_created_total 1"),
             "{text}"
@@ -363,7 +369,7 @@ mod tests {
         metrics.exec_active_inc();
         metrics.event_streams_inc();
         metrics.event_streams_dec();
-        let text = metrics.render(0);
+        let text = metrics.render(0, env!("CARGO_PKG_VERSION"));
         assert!(text.contains("bsandbox_http_in_flight 1"), "{text}");
         assert!(text.contains("bsandbox_execs_active 1"), "{text}");
         assert!(text.contains("bsandbox_event_streams_active 0"), "{text}");
@@ -375,7 +381,7 @@ mod tests {
         metrics.record_http("GET", "/health", 200, Duration::from_millis(1));
         metrics.record_http("GET", "/health", 200, Duration::from_millis(2));
         metrics.record_http("POST", "/sandboxes", 201, Duration::from_millis(3));
-        let text = metrics.render(0);
+        let text = metrics.render(0, env!("CARGO_PKG_VERSION"));
         assert!(
             text.contains(
                 "bsandbox_http_requests_total{method=\"GET\",route=\"/health\",code=\"200\"} 2"
@@ -405,7 +411,7 @@ mod tests {
         let metrics = Metrics::default();
         metrics.record_exec_duration(Duration::from_millis(4));
         metrics.record_exec_duration(Duration::from_millis(30));
-        let text = metrics.render(0);
+        let text = metrics.render(0, env!("CARGO_PKG_VERSION"));
         assert!(
             text.contains("bsandbox_exec_duration_seconds_bucket{le=\"0.005\"} 1"),
             "{text}"
