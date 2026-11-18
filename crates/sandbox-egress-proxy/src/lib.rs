@@ -37,7 +37,7 @@ pub async fn serve(listener: TcpListener, credentials: Credentials) -> io::Resul
         let creds = credentials.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(conn, creds).await {
-                eprintln!("egress-proxy: connection dropped: {e}");
+                tracing::warn!(error = %e, "egress-proxy connection dropped");
             }
         });
     }

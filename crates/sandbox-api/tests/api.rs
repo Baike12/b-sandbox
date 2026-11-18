@@ -772,6 +772,62 @@ async fn metrics_move_in_lockstep_with_the_lifecycle() {
     assert!(text.contains("bsandbox_sandboxes_active 0"), "{text}");
 }
 
+#[tokio::test]
+async fn http_metrics_follow_the_full_traffic_picture() {
+    let app = app(MockBackend::available());
+    let (app, id) = create_sandbox(app).await;
+
+    call(
+        app.clone(),
+        "POST",
+        &format!("/sandboxes/{id}/exec"),
+        Some(json!({"command": "echo"})),
+    )
+    .await;
+    // Unmatched path → router 404, still observed by the middleware.
+    call(app.clone(), "GET", "/definitely-not-a-route", None).await;
+    call_raw(app.clone(), "GET", "/metrics").await;
+
+    let (_, text) = call_raw(app, "GET", "/metrics").await;
+    assert!(
+        text.contains(
+            "bsandbox_http_requests_total{method=\"POST\",route=\"/sandboxes\",code=\"201\"} 1"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("route=\"/sandboxes/{id}/exec\""),
+        "exec request counted under its route pattern: {text}"
+    );
+    assert!(
+        text.contains("route=\"unmatched\",code=\"404\""),
+        "404s are counted too: {text}"
+    );
+    assert!(
+        text.contains("bsandbox_http_request_duration_seconds_count{route=\"/metrics\"}"),
+        "{text}"
+    );
+    // One exec ran: exactly one histogram observation, gauge drained to 0.
+    assert!(
+        text.contains("bsandbox_exec_duration_seconds_count{} 1"),
+        "{text}"
+    );
+    assert!(text.contains("bsandbox_execs_active 0"), "{text}");
+    // The scrape itself is the one request in flight while its own body is
+    // being rendered — deterministic under oneshot, and self-observation
+    // matches what a real Prometheus scrape sees.
+    assert!(text.contains("bsandbox_http_in_flight 1"), "{text}");
+}
+
+#[tokio::test]
+async fn health_reports_the_service_version() {
+    let (status, body) = call(app(MockBackend::available()), "GET", "/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let version = body["version"].as_str().unwrap_or_default();
+    assert!(!version.is_empty(), "{body}");
+    assert_eq!(version.split('.').count(), 3, "{body}");
+}
+
 // ---------- templates (commit + create-from-template) ----------
 
 #[tokio::test]
@@ -934,6 +990,46 @@ async fn sse_stream_replays_and_pushes_live_events() {
     assert!(seen.contains("id: 2"), "{seen}");
     assert!(seen.contains("id: 3"), "{seen}");
     assert!(seen.contains("\"command\""), "data payload is JSON: {seen}");
+}
+
+/// A tail must deliver the terminated event and then end — never outlive
+/// its sandbox (clients otherwise leak one stream per sandbox).
+#[tokio::test]
+async fn sse_stream_ends_after_its_sandbox_terminates() {
+    let app = app(MockBackend::available());
+    let (app, id) = create_sandbox(app).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/sandboxes/{id}/events/stream?after=0"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    // Terminate while the stream is open.
+    call(app.clone(), "DELETE", &format!("/sandboxes/{id}"), None).await;
+
+    let mut seen = String::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(3), body.frame()).await {
+            Err(_) => panic!("stream did not end after termination: {seen}"),
+            Ok(None) => break,
+            Ok(Some(Err(e))) => panic!("body error: {e}"),
+            Ok(Some(Ok(frame))) => {
+                seen.push_str(&String::from_utf8_lossy(
+                    &frame.into_data().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    assert!(seen.contains("event: sandbox_terminated"), "{seen}");
 }
 
 // ---------- auth ----------

@@ -39,6 +39,13 @@ pub async fn sweep(state: &SharedState) -> usize {
         let _ = crate::routes::remove_sandbox(state, id, "idle_ttl_expired").await;
         state.metrics.inc_sandboxes_reaped();
     }
+    state.metrics.inc_reaper_sweeps();
+    if !expired_ids.is_empty() {
+        tracing::info!(
+            count = expired_ids.len(),
+            "idle-TTL reaper terminated sandboxes"
+        );
+    }
     expired_ids.len()
 }
 

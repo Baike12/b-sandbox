@@ -30,7 +30,7 @@ impl ApiError {
             Error::Lifecycle(msg) => (StatusCode::CONFLICT, msg.clone()),
             Error::Backend { message, .. } => (StatusCode::BAD_GATEWAY, message.clone()),
             Error::Internal(full) => {
-                eprintln!("[internal] {full}");
+                tracing::error!(message = %full, "internal error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal error".to_string(),

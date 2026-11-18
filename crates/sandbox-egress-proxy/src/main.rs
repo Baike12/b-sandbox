@@ -40,6 +40,12 @@ fn load_credentials(path: &str) -> BTreeMap<String, String> {
 
 fn main() {
     let cfg = parse_args();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
     let credentials = Arc::new(load_credentials(&cfg.credentials_path));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -49,10 +55,10 @@ fn main() {
         let listener = tokio::net::TcpListener::bind(&cfg.bind)
             .await
             .unwrap_or_else(|e| panic!("cannot bind {}: {e}", cfg.bind));
-        eprintln!(
-            "egress-proxy: listening on {} ({} credential hosts)",
-            cfg.bind,
-            credentials.len()
+        tracing::info!(
+            bind = %cfg.bind,
+            hosts = credentials.len(),
+            "egress-proxy listening"
         );
         sandbox_egress_proxy::serve(listener, credentials)
             .await

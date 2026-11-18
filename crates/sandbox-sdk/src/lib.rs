@@ -87,6 +87,7 @@ pub struct SandboxDetail {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Health {
     pub status: String,
+    pub version: String,
     pub backend: serde_json::Value,
     pub sandboxes: u64,
 }

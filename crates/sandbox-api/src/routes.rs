@@ -49,6 +49,15 @@ pub fn route_table() -> Vec<RouteEntry> {
     ]
 }
 
+/// (method, path pattern) pairs of the served surface — what the
+/// observability middleware maps concrete request paths back to.
+pub fn route_patterns() -> Vec<(&'static str, &'static str)> {
+    route_table()
+        .into_iter()
+        .map(|(method, path, _)| (method, path))
+        .collect()
+}
+
 pub fn router(state: SharedState) -> Router {
     let table = route_table();
     // Token auth wraps every route; the middleware itself opens /health.
@@ -74,6 +83,12 @@ pub fn router(state: SharedState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
+        ))
+        // Outermost: observe sees even auth rejections and unmatched paths,
+        // so the metrics picture is complete traffic, not just successes.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            observe_middleware,
         ))
         .with_state(state)
 }
@@ -115,9 +130,71 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Observability middleware: one structured log line plus HTTP metrics for
+/// every request reaching the router — including auth rejections and
+/// unmatched paths. Latency measures time-to-response-headers (the SSE
+/// handshake, not the stream lifetime).
+async fn observe_middleware(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().as_str().to_owned();
+    let path = req.uri().path().to_owned();
+    let route = normalize_route(&state.route_patterns, &method, &path);
+    let started = std::time::Instant::now();
+    state.metrics.http_in_flight_inc();
+    let response = next.run(req).await;
+    state.metrics.http_in_flight_dec();
+    let elapsed = started.elapsed();
+    let status = response.status().as_u16();
+    state.metrics.record_http(&method, route, status, elapsed);
+    tracing::info!(
+        method = %method,
+        route = route,
+        path = %path,
+        status,
+        duration_ms = elapsed.as_millis() as u64,
+        "request"
+    );
+    response
+}
+
+/// Map a concrete request path back to its route-table pattern ("unmatched"
+/// when nothing fits — 404s and the like). `{id}` matches one segment, so
+/// metric cardinality stays bounded by the route table itself.
+fn normalize_route(
+    patterns: &[(&'static str, &'static str)],
+    method: &str,
+    path: &str,
+) -> &'static str {
+    patterns
+        .iter()
+        .find(|(m, p)| *m == method && path_matches(p, path))
+        .map(|(_, p)| *p)
+        .unwrap_or("unmatched")
+}
+
+fn path_matches(pattern: &str, path: &str) -> bool {
+    let mut pattern = pattern.split('/');
+    let mut path = path.split('/');
+    loop {
+        match (pattern.next(), path.next()) {
+            (None, None) => return true,
+            (Some(p), Some(s)) => {
+                if !(p.starts_with('{') || p == s) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ct_eq;
+    use super::{normalize_route, path_matches, route_patterns};
 
     #[test]
     fn constant_time_equality_matches_only_equal_slices() {
@@ -126,6 +203,43 @@ mod tests {
         assert!(!ct_eq(b"tok-1", b"tok-12"));
         assert!(!ct_eq(b"", b"a"));
         assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn concrete_paths_map_back_to_route_patterns() {
+        let patterns = route_patterns();
+        assert_eq!(
+            normalize_route(&patterns, "POST", "/sandboxes/sbx-abc123/exec"),
+            "/sandboxes/{id}/exec"
+        );
+        assert_eq!(
+            normalize_route(&patterns, "GET", "/sandboxes"),
+            "/sandboxes"
+        );
+        assert_eq!(normalize_route(&patterns, "GET", "/health"), "/health");
+    }
+
+    #[test]
+    fn unmatched_paths_collapse_to_one_label() {
+        let patterns = route_patterns();
+        assert_eq!(normalize_route(&patterns, "GET", "/nope"), "unmatched");
+        assert_eq!(normalize_route(&patterns, "PUT", "/sandboxes"), "unmatched");
+        assert_eq!(
+            normalize_route(&patterns, "POST", "/sandboxes/sbx-1/files/nope"),
+            "unmatched"
+        );
+    }
+
+    #[test]
+    fn pattern_matching_requires_segment_count_equality() {
+        assert!(path_matches(
+            "/sandboxes/{id}/exec",
+            "/sandboxes/sbx-1/exec"
+        ));
+        assert!(!path_matches("/sandboxes/{id}/exec", "/sandboxes/exec"));
+        assert!(!path_matches("/sandboxes/{id}", "/sandboxes/a/b"));
+        assert!(path_matches("/health", "/health"));
+        assert!(!path_matches("/health", "/healthz"));
     }
 }
 
@@ -136,6 +250,7 @@ async fn health(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let count = state.registry.read().unwrap().len();
     Json(json!({
         "status": if backend_health.available { "ok" } else { "degraded" },
+        "version": env!("CARGO_PKG_VERSION"),
         "backend": {
             "name": state.backend.name(),
             "available": backend_health.available,
@@ -342,18 +457,20 @@ pub(crate) async fn remove_sandbox(state: &SharedState, id: &str, reason: &str) 
         .ok_or_else(|| sandbox_not_found(id))?;
     state.idempotency.write().unwrap().retain(|_, v| v != id);
 
-    // Lifecycle: running/paused → terminated. Backend stop + deprovision
-    // then physically remove the environment.
-    let _ = record
-        .lifecycle
-        .lock()
-        .unwrap()
-        .transition(LifecycleState::Terminated);
+    // Lifecycle: running/paused → terminated. The termination event is
+    // pushed BEFORE the lifecycle flips — the SSE tail drains events first
+    // and then checks the lifecycle, so this ordering is what guarantees a
+    // stream always delivers the terminated event before closing.
     record
         .events
         .lock()
         .unwrap()
         .push(EventKind::SandboxTerminated, json!({"reason": reason}));
+    let _ = record
+        .lifecycle
+        .lock()
+        .unwrap()
+        .transition(LifecycleState::Terminated);
 
     state.metrics.inc_sandboxes_terminated();
     state.backend.stop(&record.ctx).await?;
@@ -500,10 +617,14 @@ async fn exec(
         .push(EventKind::ExecStarted, json!({"command": request.command}));
     record.usage.lock().unwrap().record_exec_started(now_ms());
     state.metrics.inc_execs_started();
-
+    state.metrics.exec_active_inc();
+    // The gauge slot is released on every exit path (backend errors
+    // included) — a leaked in-flight slot would be a false capacity signal.
     let started = std::time::Instant::now();
+    let _active = ExecGauge(&state.metrics);
     let outcome = state.backend.exec(&record.ctx, request.clone()).await?;
     let wall_ms = started.elapsed().as_millis() as u64;
+    state.metrics.record_exec_duration(started.elapsed());
     let output_bytes = outcome.stdout.len() + outcome.stderr.len();
     record.usage.lock().unwrap().record_exec_outcome(
         outcome.timed_out,
@@ -529,6 +650,23 @@ async fn exec(
     record.events.lock().unwrap().push(kind, data);
 
     Ok(Json(outcome))
+}
+
+/// Drops the execs_active gauge slot when the exec future ends (value or
+/// error), so the gauge can never leak an in-flight slot.
+struct ExecGauge<'a>(&'a crate::metrics::Metrics);
+impl Drop for ExecGauge<'_> {
+    fn drop(&mut self) {
+        self.0.exec_active_dec();
+    }
+}
+
+/// Drops the event-streams gauge slot when an SSE tail task ends.
+struct StreamGauge<'a>(&'a crate::metrics::Metrics);
+impl Drop for StreamGauge<'_> {
+    fn drop(&mut self) {
+        self.0.event_streams_dec();
+    }
 }
 
 // ---------- file data plane ----------
@@ -786,7 +924,12 @@ async fn events_stream(
     let mut cursor = reconnect_cursor.or(query.after).unwrap_or(0);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
+    state.metrics.event_streams_inc();
+    let tail_state = state.clone();
     tokio::spawn(async move {
+        // One stream = one counted slot, released when the tail ends for any
+        // reason (client disconnect, sandbox termination, server shutdown).
+        let _stream = StreamGauge(&tail_state.metrics);
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
         loop {
             ticker.tick().await;
@@ -805,6 +948,16 @@ async fn events_stream(
                     // The client disconnected; the record drops with this task.
                     return;
                 }
+            }
+            // Only after draining: a terminated sandbox or a draining server
+            // ends the tail. The terminated event itself is delivered first
+            // because remove_sandbox pushes it before flipping the lifecycle.
+            if tail_state
+                .shutdown
+                .load(std::sync::atomic::Ordering::Relaxed)
+                || record.lifecycle.lock().unwrap().state() == LifecycleState::Terminated
+            {
+                return;
             }
         }
     });

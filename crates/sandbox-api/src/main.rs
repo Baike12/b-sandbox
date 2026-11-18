@@ -34,6 +34,18 @@ struct Config {
     egress_credentials: Option<String>,
 }
 
+/// Structured logging: `tracing` to stderr, level from `B_SANDBOX_LOG`
+/// (default `info`). Uninitialized subscribers are no-ops, so library tests
+/// stay quiet unless they opt in.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 fn parse_args() -> Config {
     let mut cfg = Config {
         data_root: PathBuf::from("/data/b-sandbox"),
@@ -102,7 +114,7 @@ async fn start_egress_proxy(addr: &str, credentials_path: &str) {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("egress proxy cannot bind {addr}: {e}"));
-    eprintln!("egress-proxy: listening on {addr}");
+    tracing::info!(addr, "egress-proxy listening");
     tokio::spawn(async move {
         sandbox_egress_proxy::serve(listener, Arc::new(credentials))
             .await
@@ -144,6 +156,7 @@ fn main() {
         _ => panic!("--egress-proxy and --egress-credentials must be given together"),
     }
     let backend = build_backend(&cfg).unwrap_or_else(|e| panic!("{e}"));
+    init_tracing();
     let health = backend.health();
     if !health.available {
         // Fail loudly at startup: a service that cannot isolate must not
@@ -151,12 +164,13 @@ fn main() {
         let reason = health.reason.as_deref().unwrap_or("unknown");
         panic!("backend {:?} unavailable: {reason}", backend.name());
     }
-    eprintln!(
-        "b-sandbox: backend={} data-root={} listening on {}:{}",
-        backend.name(),
-        cfg.data_root.display(),
-        cfg.bind,
-        cfg.port
+    tracing::info!(
+        backend = backend.name(),
+        version = env!("CARGO_PKG_VERSION"),
+        data_root = %cfg.data_root.display(),
+        bind = %cfg.bind,
+        port = cfg.port,
+        "b-sandbox starting"
     );
 
     let state = Arc::new(

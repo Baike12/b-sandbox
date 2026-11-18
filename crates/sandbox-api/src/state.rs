@@ -31,6 +31,13 @@ pub struct AppState {
     /// Shared bearer token. None = open service (localhost + nginx posture);
     /// Some = every route except /health requires `Authorization: Bearer …`.
     pub auth_token: Option<String>,
+    /// (method, path-pattern) pairs copied from the route table at build
+    /// time; the observability middleware maps raw request paths back to
+    /// patterns so metrics cardinality is bounded by the route table.
+    pub route_patterns: Vec<(&'static str, &'static str)>,
+    /// Set just before graceful shutdown drains the server; long-lived SSE
+    /// tails watch it and end their streams so connections can close.
+    pub shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct SandboxRecord {
@@ -65,6 +72,8 @@ impl AppState {
             data_root,
             metrics: Default::default(),
             auth_token: None,
+            route_patterns: crate::routes::route_patterns(),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

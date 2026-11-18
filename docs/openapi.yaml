@@ -41,6 +41,7 @@ paths:
                 type: object
                 properties:
                   status: { type: string, enum: [ok, degraded] }
+                  version: { type: string, description: Service version (semver) }
                   backend:
                     type: object
                     properties:
@@ -398,9 +399,12 @@ paths:
       responses:
         "200":
           description: |
-            bsandbox_* counters and gauges: sandboxes created/active/
-            terminated/reaped, execs started/finished/timed_out/truncated,
-            exec output bytes, file ops.
+            bsandbox_* counters, gauges, and histograms: sandboxes
+            created/active/terminated/reaped, reaper sweeps, startup orphans,
+            execs started/finished/timed_out/truncated (with a latency
+            histogram), exec output bytes, file ops, HTTP requests by
+            method/route/status with per-route latency histograms, and
+            in-flight gauges (http/exec/event-streams).
           content:
             text/plain:
               schema: { type: string }
