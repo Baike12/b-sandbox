@@ -136,22 +136,47 @@ pub struct CreateOptions {
 pub struct Client {
     base: String,
     token: Option<String>,
+    /// Whole-request deadline for every call except `exec`, which budgets
+    /// itself from the caller's own `timeout_ms` (mirroring the server's
+    /// unwrap-or-ceiling). Without a deadline a hung server hangs the caller
+    /// forever — a client library must fail observably, not silently.
+    request_timeout: std::time::Duration,
     http: hyper_util::client::legacy::Client<HttpConnector, http_body_util::Full<Bytes>>,
 }
+
+/// Default whole-request deadline (the server's own handler budgets run far
+/// under this; the SSE stream endpoints are not routed through `send`).
+const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Margin over the caller's exec budget: covers request/response framing on
+/// top of the process's own lifetime.
+const EXEC_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+/// Connect timeout: a dead or unreachable server must fail in seconds, not
+/// ride the OS default (which can be minutes).
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Client {
     /// `base` like `http://127.0.0.1:8094` (a trailing slash is fine).
     pub fn new(base: impl Into<String>) -> Self {
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
         Self {
             base: base.into().trim_end_matches('/').to_string(),
             token: None,
-            http: hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            http: hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+                .build(connector),
         }
     }
 
     /// Shared bearer token (see the OpenAPI securitySchemes note).
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
+        self
+    }
+
+    /// Whole-request deadline for every route except `exec`.
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -227,7 +252,19 @@ impl Client {
             "cwd": spec.cwd,
             "timeoutMs": spec.timeout_ms,
         });
-        self.post_json(&format!("/sandboxes/{id}/exec"), body).await
+        // Mirror the server: `timeoutMs: None` means the ceiling, so the
+        // client deadline must cover the longest legitimate exec, not the
+        // default request timeout.
+        let budget = spec
+            .timeout_ms
+            .unwrap_or(sandbox_core::backend::EXEC_TIMEOUT_MS_CEILING);
+        let req = self.request(Method::POST, &format!("/sandboxes/{id}/exec"), Some(body));
+        self.send_with_deadline(
+            req,
+            decode_json,
+            std::time::Duration::from_millis(budget) + EXEC_TIMEOUT_MARGIN,
+        )
+        .await
     }
 
     pub async fn file_write(&self, id: &str, path: &str, content: &str) -> Result<()> {
@@ -333,20 +370,45 @@ impl Client {
         req: Request<http_body_util::Full<Bytes>>,
         decode: impl FnOnce(u16, &[u8]) -> Result<T>,
     ) -> Result<T> {
-        let response = self.http.request(req).await.map_err(|e| SdkError {
-            status: 0,
-            code: "transport".into(),
-            message: e.to_string(),
-        })?;
-        let status = response.status().as_u16();
-        let bytes = http_body_util::BodyExt::collect(response.into_body())
+        self.send_with_deadline(req, decode, self.request_timeout)
             .await
+    }
+
+    async fn send_with_deadline<T>(
+        &self,
+        req: Request<http_body_util::Full<Bytes>>,
+        decode: impl FnOnce(u16, &[u8]) -> Result<T>,
+        deadline: std::time::Duration,
+    ) -> Result<T> {
+        let response = tokio::time::timeout(deadline, self.http.request(req))
+            .await
+            .map_err(|_| SdkError {
+                status: 0,
+                code: "transport".into(),
+                message: format!("request exceeded the {deadline:?} deadline"),
+            })?
             .map_err(|e| SdkError {
-                status,
+                status: 0,
                 code: "transport".into(),
                 message: e.to_string(),
-            })?
-            .to_bytes();
+            })?;
+        let status = response.status().as_u16();
+        let bytes = tokio::time::timeout(
+            deadline,
+            http_body_util::BodyExt::collect(response.into_body()),
+        )
+        .await
+        .map_err(|_| SdkError {
+            status,
+            code: "transport".into(),
+            message: format!("response body exceeded the {deadline:?} deadline"),
+        })?
+        .map_err(|e| SdkError {
+            status,
+            code: "transport".into(),
+            message: e.to_string(),
+        })?
+        .to_bytes();
         decode(status, &bytes)
     }
 
