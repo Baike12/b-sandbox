@@ -222,6 +222,164 @@ fn spec_version_is_a_bumpable_semver() {
     }
 }
 
+/// Extract the property names of a named schema from `components.schemas`.
+/// Handles the two styles this spec uses: a direct `properties:` block and an
+/// `allOf:` whose object arm carries the properties (flattened views). Style
+/// drift fails loudly: a schema with no recognized property block panes the
+/// test instead of passing vacuously.
+fn schema_properties(name: &str) -> std::collections::BTreeSet<String> {
+    let header = format!("    {name}:");
+    let lines: Vec<&str> = SPEC.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| *l == header)
+        .unwrap_or_else(|| panic!("schema {name} must exist in the spec"));
+    let mut props = std::collections::BTreeSet::new();
+    for line in lines.iter().skip(start + 1) {
+        // Next 4-space schema key ends this schema's block.
+        if line.starts_with("    ") && !line.starts_with("      ") {
+            break;
+        }
+        // Direct style: 8-space `key:` under `      properties:`.
+        let direct = line.strip_prefix("        ");
+        // allOf style: 12-space `key:` under `          properties:`.
+        let flattened = line.strip_prefix("            ");
+        for candidate in [direct, flattened].into_iter().flatten() {
+            if let Some(key) = candidate
+                .split(':')
+                .next()
+                .filter(|k| k.chars().all(|c| c.is_ascii_alphanumeric()))
+            {
+                props.insert(key.to_string());
+            }
+        }
+    }
+    assert!(
+        !props.is_empty(),
+        "schema {name} must declare properties; the extraction style drifted"
+    );
+    props
+}
+
+/// The serialized shape of a model must equal the documented schema property
+/// set — both directions: a field the code writes but the spec omits is an
+/// undocumented contract break; a spec field the code never writes is a lie
+/// clients will code against.
+#[test]
+fn usage_ledger_schema_matches_serialization() {
+    use sandbox_api::ledger::UsageLedger;
+    let ledger = UsageLedger::new(1);
+    let written: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&serde_json::to_string(&ledger).expect("serializes")).expect("object");
+    assert_eq!(
+        written
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        schema_properties("UsageLedger")
+    );
+}
+
+#[test]
+fn exec_outcome_schema_matches_serialization() {
+    let outcome = sandbox_core::ExecOutcome {
+        exit_code: Some(0),
+        timed_out: false,
+        stdout: String::new(),
+        stderr: String::new(),
+        truncated: false,
+    };
+    let written: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&serde_json::to_string(&outcome).expect("serializes"))
+            .expect("object");
+    assert_eq!(
+        written
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        schema_properties("ExecOutcome")
+    );
+}
+
+/// Extract property names of a nested section (`net`, `fs`, …) inside a
+/// top-level schema: `    Schema:` → `        section:` → `          properties:`
+/// → 12-space `key:` entries, until the block dedents.
+fn nested_schema_properties(schema: &str, section: &str) -> std::collections::BTreeSet<String> {
+    let lines: Vec<&str> = SPEC.lines().collect();
+    let schema_header = format!("    {schema}:");
+    let schema_start = lines
+        .iter()
+        .position(|l| *l == schema_header)
+        .unwrap_or_else(|| panic!("schema {schema} must exist in the spec"));
+    let section_header = format!("        {section}:");
+    let section_start = lines[schema_start..]
+        .iter()
+        .position(|l| *l == section_header)
+        .unwrap_or_else(|| panic!("schema {schema} must have a {section} section"))
+        + schema_start;
+    let mut props = std::collections::BTreeSet::new();
+    for line in lines.iter().skip(section_start + 1) {
+        if line.starts_with("        ") && !line.starts_with("          ") {
+            break; // next section of the schema
+        }
+        if let Some(key) = line
+            .strip_prefix("            ")
+            .and_then(|rest| rest.split(':').next())
+            .filter(|k| k.chars().all(|c| c.is_ascii_alphanumeric()))
+        {
+            props.insert(key.to_string());
+        }
+    }
+    assert!(
+        !props.is_empty(),
+        "schema {schema}.{section} must declare properties; the extraction style drifted"
+    );
+    props
+}
+
+#[test]
+fn net_policy_schema_matches_serialization() {
+    use sandbox_core::policy::{EgressDefault, NetPolicy, NetTarget};
+    // Every field populated: skip_serializing_if fields appear, so the
+    // comparison is exact equality in both directions.
+    let policy = NetPolicy {
+        egress_default: EgressDefault::Deny,
+        allow: vec![NetTarget {
+            target: "example.com".into(),
+        }],
+        deny: vec![NetTarget {
+            target: "203.0.113.0/24".into(),
+        }],
+        proxy: true,
+    };
+    let written: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&serde_json::to_string(&policy).expect("serializes")).expect("object");
+    assert_eq!(
+        written
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        nested_schema_properties("SandboxSpec", "net")
+    );
+}
+
+#[test]
+fn budget_schema_matches_serialization() {
+    let budget = sandbox_core::Budget {
+        memory_mb: Some(512),
+        pids_max: Some(64),
+    };
+    let written: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&serde_json::to_string(&budget).expect("serializes")).expect("object");
+    assert_eq!(
+        written
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        nested_schema_properties("SandboxSpec", "budget")
+    );
+}
+
 /// include_str! pins the spec to docs/openapi.yaml — moving it breaks the
 /// build, not silently the contract. This asserts the parsed file is really
 /// the OpenAPI document, not an empty stub.

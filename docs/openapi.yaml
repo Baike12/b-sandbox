@@ -29,6 +29,7 @@ paths:
     get:
       tags: [observability]
       summary: Backend availability and live sandbox count
+      security: [] # unauthenticated: liveness probes must work without a token
       responses:
         "200":
           description: |
@@ -95,6 +96,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/SandboxView" }
         "400": { $ref: "#/components/responses/PolicyError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "503": { $ref: "#/components/responses/BackendUnavailable" }
     get:
       tags: [lifecycle]
@@ -409,6 +412,11 @@ paths:
             text/plain:
               schema: { type: string }
 
+# Default: every route requires the bearer token when one is configured.
+# /health opts out (liveness probes must never need credentials).
+security:
+  - bearerAuth: []
+
 components:
   securitySchemes:
     bearerAuth:
@@ -426,6 +434,16 @@ components:
       schema: { type: string, pattern: "^sbx-[0-9a-f]{16}$" }
 
   responses:
+    Unauthorized:
+      description: Missing or wrong bearer token (token auth enabled)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    PayloadTooLarge:
+      description: Request body exceeds the 8 MiB limit (fail closed, not a silent truncate)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
     PolicyError:
       description: Policy/budget validation failure (fail closed)
       content:
@@ -453,6 +471,16 @@ components:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
   schemas:
+    NetTarget:
+      type: object
+      required: [target]
+      properties:
+        target:
+          type: string
+          description: |
+            CIDR (`10.0.0.0/8`) or hostname (`example.com`, `*.example.com`).
+            A wildcard is only valid as the leading `*.` label.
+
     ErrorEnvelope:
       type: object
       properties:
@@ -483,24 +511,33 @@ components:
               items: { type: string }
         net:
           type: object
+          description: |
+            Egress policy. Deny is the baseline; allow targets open holes;
+            allow wins over deny on overlap — except protected ranges
+            (loopback, RFC1918, link-local, cloud metadata), which no caller
+            can ever open.
           properties:
+            egressDefault:
+              type: string
+              enum: [deny, allow]
+              default: deny
+              description: Posture for targets not named in allow/deny.
+            allow:
+              type: array
+              items: { $ref: "#/components/schemas/NetTarget" }
+            deny:
+              type: array
+              items: { $ref: "#/components/schemas/NetTarget" }
             proxy:
               type: boolean
+              default: false
               description: |
-                Route all egress through the service credential-injection proxy.
-                The workload gets exactly one network hole (the proxy) and
-                standard proxy env vars; credentials live in the proxy, never
-                in the sandbox. Rejects allow/deny lists and an allow default.
-                Requires the backend NET_EGRESS_PROXY capability (seatbelt tier).
-              type: object
-              properties:
-                mode: { type: string, enum: [deny, allow] }
-                allow:
-                  type: array
-                  items: { type: string }
-                deny:
-                  type: array
-                  items: { type: string }
+                Route all egress through the service credential-injection
+                proxy. The workload gets exactly one network hole (the proxy)
+                and standard proxy env vars; credentials live in the proxy,
+                never in the sandbox. Rejects allow/deny lists and an allow
+                default. Requires the backend NET_EGRESS_PROXY capability
+                (seatbelt tier).
         exec:
           type: object
           properties:
@@ -508,9 +545,22 @@ components:
             maxOpenFiles: { type: integer }
         budget:
           type: object
+          description: |
+            Resource ceilings. A field the caller omits means "no opinion, use
+            the default"; a field the caller sets means enforce-this-or-reject —
+            setting a field to the default value is still an explicit request
+            and requires a backend that can enforce it.
           properties:
-            memoryMb: { type: integer }
-            pidsMax: { type: integer }
+            memoryMb:
+              type: integer
+              minimum: 1
+              maximum: 32768
+              description: Address-space ceiling in MiB (default 2048).
+            pidsMax:
+              type: integer
+              minimum: 1
+              maximum: 2048
+              description: Max concurrent processes/threads (default 512).
 
     SandboxView:
       type: object
@@ -582,12 +632,11 @@ components:
                   - sandbox_created
                   - sandbox_paused
                   - sandbox_resumed
+                  - template_committed
                   - exec_started
                   - exec_finished
                   - exec_timed_out
-                  - sandbox_killed
                   - sandbox_terminated
-                  - policy_denied
               data: { type: object }
         lastSeq: { type: integer }
         dropped: { type: integer }

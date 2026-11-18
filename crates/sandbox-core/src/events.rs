@@ -37,9 +37,7 @@ pub enum EventKind {
     ExecStarted,
     ExecFinished,
     ExecTimedOut,
-    SandboxKilled,
     SandboxTerminated,
-    PolicyDenied,
 }
 
 /// Bounded, thread-safe per-sandbox event log.
@@ -174,9 +172,9 @@ mod tests {
     #[test]
     fn events_serialize_snake_case() {
         let mut log = log();
-        let event = log.push(EventKind::SandboxKilled, serde_json::json!({}));
+        let event = log.push(EventKind::TemplateCommitted, serde_json::json!({}));
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"kind\":\"sandbox_killed\""), "{json}");
+        assert!(json.contains("\"kind\":\"template_committed\""), "{json}");
         assert!(json.contains("\"tsMs\""), "{json}");
     }
 
