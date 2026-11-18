@@ -11,8 +11,9 @@
 //! - policy denied paths are masked with `--tmpfs` (denial is viral: the
 //!   whole subtree vanishes under the mask).
 //!
-//! Egress: `--unshare-net` for deny-all; nothing for allow (shared host net).
-//! Rule-based egress is NOT declared in M1 (see backend capabilities).
+//! Egress: `--unshare-net` for deny-all; allow shares the host network
+//! namespace (documented NET_EGRESS_DEFAULT semantics). Rule-based egress is
+//! NOT declared in M1 (see backend capabilities).
 
 use std::path::Path;
 
@@ -30,9 +31,17 @@ pub fn generate(
 ) -> Vec<String> {
     let rootfs = rootfs.to_string_lossy().into_owned();
     let mut argv: Vec<String> = vec![
-        // Isolation baseline. --new-privileges sets no_new_privs so setuid
-        // inside the sandbox can never escalate beyond the mapped user.
-        "--unshare-all".into(),
+        // Isolation baseline: explicit namespaces, NOT --unshare-all. An
+        // unconditional all-namespace unshare makes the deny/allow egress
+        // posture dead code (the net namespace is always empty, so "allow"
+        // would silently deny). Unshares run before the mounts below so the
+        // fresh /proc reflects the new PID namespace.
+        "--unshare-pid".into(),
+        "--unshare-ipc".into(),
+        "--unshare-uts".into(),
+        "--unshare-cgroup-try".into(),
+        // --new-privileges sets no_new_privs so setuid inside the sandbox can
+        // never escalate beyond the mapped user.
         "--new-session".into(),
         "--new-privileges".into(),
         "--die-with-parent".into(),
@@ -127,6 +136,15 @@ mod tests {
         NetPolicy::default().resolve().unwrap()
     }
 
+    fn allow_net() -> ResolvedNetPolicy {
+        NetPolicy {
+            egress_default: sandbox_core::policy::EgressDefault::Allow,
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap()
+    }
+
     fn contains(argv: &[String], needle: &str) -> bool {
         argv.iter().any(|a| a == needle)
     }
@@ -135,7 +153,9 @@ mod tests {
     fn isolation_baseline_present() {
         let argv = fixture(FsPolicy::default(), default_net(), "/tmp/r");
         for flag in [
-            "--unshare-all",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
             "--new-session",
             "--new-privileges",
             "--die-with-parent",
@@ -144,6 +164,20 @@ mod tests {
         }
         assert!(contains(&argv, "--proc") && contains(&argv, "/proc"));
         assert!(contains(&argv, "--dev") && contains(&argv, "/dev"));
+    }
+
+    #[test]
+    fn allow_posture_shares_the_host_net_namespace() {
+        // The regression: --unshare-all left the net namespace empty in EVERY
+        // posture, so "allow" silently denied all egress while the argv looked
+        // generous. Allow must not unshare the net namespace at all.
+        let argv = fixture(FsPolicy::default(), allow_net(), "/tmp/r");
+        assert!(
+            !contains(&argv, "--unshare-net"),
+            "allow must share host net"
+        );
+        let deny = fixture(FsPolicy::default(), default_net(), "/tmp/r");
+        assert!(contains(&deny, "--unshare-net"), "deny must unshare net");
     }
 
     #[test]
