@@ -75,7 +75,7 @@
 | # | 标准 | 参考证据 | b-sandbox 状态 |
 | --- | --- | --- | --- |
 | Sec1 | 默认拒绝 + 显式放行 | mxc `(deny default)` 头 + 尾部 deny 规则 | ✅ Seatbelt deny-default profile；net 默认拒绝，loopback 单孔 |
-| Sec2 | egress 凭据不进沙箱 | CubeEgress `secret_ref` 注入；microsandbox SNI+DNS 钉扎注入 | ✅ 凭据注入代理：配置主机替换 Authorization，其余透传；凭据只在内存 + 0600 文件 |
+| Sec2 | egress 凭据不进沙箱 + 目的地过滤 | CubeEgress `secret_ref` 注入；microsandbox 默认封禁 RFC1918/ULA/loopback/169.254.169.254 并做 DNS 解析校验 | ✅ 凭据注入代理（配置主机替换 Authorization，其余透传）+ **EgressPolicy::DenyPrivate**：CONNECT/转发一律拒绝私网/环回/链路本地/CGNAT，DNS 名解析出被禁地址即整体拒绝（防 rebinding），连接 5s 超时，拒绝可观测（403/502 信封） |
 | Sec3 | 路径逃逸=攻击（fail closed） | mxc `filesystem_resolve.rs` 最严 wins | ✅ canonical + 逃逸即 400；对抗测试覆盖 traversal/symlink |
 | Sec4 | 认证：常量时间比较；探测端点免认证 | CubeAPI 三模式 auth（回调不可达=内部错误，绝不放行） | ✅ Bearer + ct_eq；/health 恒开 |
 | Sec5 | 双实例/越权防护 | microsandbox 目录 0700、symlink 拒绝 | ✅ ServiceLock；❗ data_root 权限 0700 约定未在代码里强制（部署文档约定） |

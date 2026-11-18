@@ -41,6 +41,7 @@
 - fork bomb 受 pids 预算限制
 - 网络默认拒绝 + net.proxy 单孔模式：正向（curl 经代理 → 上游收到 `Authorization: Bearer tok-123`）与负向（NO_PROXY 直连 → 非零退出、上游未见任何请求）
 - egress 代理：配置主机注入、非配置主机透传不丢头、CONNECT 隧道、畸形目标 400
+- **egress 目的地策略**（`deny_private_blocks_connect_to_loopback` / `deny_private_blocks_absolute_form_to_loopback` / `deny_private_blocks_names_resolving_to_private_addresses`）：私网/环回/链路本地/CGNAT 目标在 CONNECT 与转发两条路径都被 403 拒绝；解析到被禁地址的 DNS 名整体拒绝；策略单元测试覆盖每个地址段（含 100.64/10、198.18/15 这类 std `is_private` 不覆盖的段）；AllowAll 显式选择后内网目标可达（部署自有内部服务用）
 
 ## 4. 性能实测
 
@@ -106,6 +107,7 @@ INFO server drained; exiting      ← 进程退出（graceful drain 完成）
 | 超限请求体返回 axum 纯文本 413，破坏错误信封契约 | P1 | E2B"契约即产品"对标 | 8 MiB 上限 + `payload_too_large` 信封（commit daa7c67） |
 | `/var/folders` vs `/private/var/folders`：bench 后端 rootfs 未 canonicalize → 文件面全部 400 | P2（测试） | bench 首跑 | canonicalize（tests/bench.rs） |
 | scripts/bench.sh 末尾 `wait` 在 trap 发 SIGTERM 前执行 → 死等 | P2（脚本） | 首跑挂起 | 删除该行（scripts/bench.sh） |
+| egress 代理目的地不设限：net.proxy 沙箱可借 CONNECT 隧道打宿主机 loopback 服务/169.254.169.254/RFC1918（代理进程不受沙箱约束） | **P0（安全）** | 对标 microsandbox 网络隔离文档自查 | `EgressPolicy::DenyPrivate` 默认 + DNS 解析校验 + 403/502 可观测拒绝（commit 93d5358） |
 
 ## 7. 复现清单
 
