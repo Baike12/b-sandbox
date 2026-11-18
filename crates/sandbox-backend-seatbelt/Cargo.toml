@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing.workspace = true
 sandbox-core = { path = "../sandbox-core" }
 tokio = { workspace = true }
 libc = { workspace = true }

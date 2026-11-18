@@ -55,9 +55,27 @@ fn process_exec_paths() -> Vec<&'static str> {
 fn subpaths(paths: &[&str]) -> String {
     paths
         .iter()
-        .map(|p| format!(r#"(subpath "{p}")"#))
+        .map(|p| format!("(subpath {})", quote(p)))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Render one path as a Seatbelt string literal. Backslash and double-quote
+/// are escaped: an unescaped policy path is profile injection — a `"` closes
+/// the literal and the rest of the line is arbitrary rules. (normalize_absolute
+/// rejects such paths upstream; this is the emit-side backstop.)
+fn quote(p: &str) -> String {
+    let mut out = String::with_capacity(p.len() + 8);
+    out.push('"');
+    for c in p.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Generate the Seatbelt scheme for one sandbox. `egress_proxy` is the
@@ -70,7 +88,6 @@ pub fn generate(
     rootfs: &Path,
     egress_proxy: Option<&str>,
 ) -> String {
-    let rootfs = rootfs.to_string_lossy();
     let mut scheme = String::with_capacity(4096);
 
     scheme.push_str("(version 1)\n");
@@ -101,7 +118,8 @@ pub fn generate(
 
     // 4. Rootfs: the implicit writable scratch area.
     scheme.push_str(&format!(
-        "(allow file-read* file-write* (subpath \"{rootfs}\"))\n"
+        "(allow file-read* file-write* (subpath {}))\n",
+        quote(&rootfs.to_string_lossy())
     ));
 
     // 5. Policy grants. Normalization guarantees these are disjoint from the
@@ -110,7 +128,7 @@ pub fn generate(
         let paths: Vec<String> = fs
             .readonly
             .iter()
-            .map(|p| format!(r#"(subpath "{}")"#, p.to_string_lossy()))
+            .map(|p| format!("(subpath {})", quote(&p.to_string_lossy())))
             .collect();
         scheme.push_str(&format!("(allow file-read* {})\n", paths.join(" ")));
     }
@@ -118,7 +136,7 @@ pub fn generate(
         let paths: Vec<String> = fs
             .readwrite
             .iter()
-            .map(|p| format!(r#"(subpath "{}")"#, p.to_string_lossy()))
+            .map(|p| format!("(subpath {})", quote(&p.to_string_lossy())))
             .collect();
         scheme.push_str(&format!(
             "(allow file-read* file-write* {})\n",
@@ -131,12 +149,12 @@ pub fn generate(
             .readonly
             .iter()
             .chain(fs.readwrite.iter())
-            .map(|p| format!(r#"(subpath "{}")"#, p.to_string_lossy()))
+            .map(|p| format!("(subpath {})", quote(&p.to_string_lossy())))
             .collect();
         exec_paths.extend(
             process_exec_paths()
                 .into_iter()
-                .map(|p| format!(r#"(subpath "{p}")"#)),
+                .map(|p| format!("(subpath {})", quote(p))),
         );
         scheme.push_str(&format!("(allow process-exec {})\n", exec_paths.join(" ")));
     }
@@ -170,9 +188,9 @@ pub fn generate(
 
     // 7. Denied paths last — they shadow any overlapping earlier allow.
     for p in &fs.denied {
-        let p = p.to_string_lossy();
         scheme.push_str(&format!(
-            "(deny file-read* file-read-metadata file-write* (subpath \"{p}\"))\n"
+            "(deny file-read* file-read-metadata file-write* network-bind network-outbound (subpath {}))\n",
+            quote(&p.to_string_lossy())
         ));
     }
 
@@ -183,6 +201,7 @@ pub fn generate(
 mod tests {
     use super::*;
     use sandbox_core::policy::FsPolicy;
+    use std::path::PathBuf;
 
     fn fixture(fs: FsPolicy, net: ResolvedNetPolicy, rootfs: &str) -> String {
         generate(&fs.resolve().unwrap(), &net, Path::new(rootfs), None)
@@ -248,7 +267,7 @@ mod tests {
             "/tmp/r",
         );
         let deny_line_pos = scheme
-            .rfind(r#"(deny file-read* file-read-metadata file-write* (subpath "/private/etc/secret"))"#)
+            .rfind(r#"(deny file-read* file-read-metadata file-write* network-bind network-outbound (subpath "/private/etc/secret"))"#)
             .expect("deny line present");
         // Everything after it is only further deny lines.
         let tail = &scheme[deny_line_pos..];
@@ -295,6 +314,29 @@ mod tests {
         assert!(scheme.contains("(allow system-socket)"));
         // No blanket allow.
         assert!(!scheme.contains("(allow network-outbound)\n"));
+    }
+
+    #[test]
+    fn quoted_paths_cannot_inject_rules() {
+        // normalize_absolute rejects quote-bearing paths upstream; this test
+        // pins the emit-side backstop: even a quote path that reaches the
+        // generator renders as an inert escaped literal, never as rules.
+        let mut fs = ResolvedFsPolicy::default();
+        fs.readwrite
+            .insert(PathBuf::from("/x\")) (allow default) ;\""));
+        let scheme = generate(&fs, &default_net(), Path::new("/tmp/r"), None);
+        // The injection text may appear only INSIDE an escaped literal; it
+        // must never exist as a rule line of its own.
+        assert!(
+            !scheme
+                .lines()
+                .any(|l| l.trim_start().starts_with("(allow default)")),
+            "{scheme}"
+        );
+        assert!(
+            scheme.contains(r#"(subpath "/x\")) (allow default) ;\""#),
+            "escaped literal present: {scheme}"
+        );
     }
 
     #[test]

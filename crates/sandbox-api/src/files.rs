@@ -40,7 +40,12 @@ pub fn resolve_sandbox_path(rootfs: &Path, rel: &str, allow_missing: bool) -> Re
     // The final path is missing. Strict mode (allow_missing=false) treats
     // that as a client error (400 policy_validation); permissive mode
     // canonicalizes the deepest existing ancestor and re-attaches the
-    // (already lexically safe) remainder, deepest-first.
+    // (already lexically safe) remainder — walking every appended component
+    // with symlink_metadata first. A dangling symlink canonicalizes as
+    // missing, so the lexical re-attach alone would resolve THROUGH it at
+    // kernel time: a deterministic host-write primitive, not a race. Each
+    // appended component is therefore checked for being a symlink, and any
+    // hit is a policy error.
     if !allow_missing {
         return Err(Error::Policy(format!(
             "sandbox path {rel:?} does not exist"
@@ -53,15 +58,24 @@ pub fn resolve_sandbox_path(rootfs: &Path, rel: &str, allow_missing: bool) -> Re
             let mut resolved = existing;
             for comp in missing_tail.iter().rev() {
                 resolved.push(comp);
+                if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+                    && meta.file_type().is_symlink()
+                {
+                    return Err(Error::Policy(format!(
+                        "sandbox path {rel:?} traverses a symlink: {resolved:?}"
+                    )));
+                }
             }
             return ensure_within(rootfs, resolved);
         }
-        let popped_name = probe.file_name().map(|n| n.to_os_string());
-        if !probe.pop() || popped_name.is_none() {
-            // Reached the root without finding anything existing.
+        let popped_name = match probe.file_name() {
+            Some(name) => name.to_os_string(),
+            None => break,
+        };
+        if !probe.pop() {
             break;
         }
-        missing_tail.push(popped_name.unwrap());
+        missing_tail.push(popped_name);
     }
 
     Err(Error::Policy(format!(
@@ -121,6 +135,20 @@ mod tests {
             let err = resolve_sandbox_path(&rootfs, raw, true).unwrap_err();
             assert_eq!(err.code(), "policy_validation", "{raw:?}");
         }
+    }
+
+    #[test]
+    fn dangling_symlink_tail_is_rejected() {
+        // The missing-tail resolver must not re-attach lexical components
+        // through a dangling symlink: canonicalize fails on the link, the
+        // name lands in the tail, and the kernel would resolve the write
+        // outside the rootfs. Deterministic, not a race.
+        let (tmp, rootfs) = fixture();
+        std::os::unix::fs::symlink("/etc/host-does-not-care", rootfs.join("doorway")).unwrap();
+        let err = resolve_sandbox_path(&rootfs, "doorway/planted.txt", true).unwrap_err();
+        assert_eq!(err.code(), "policy_validation");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        let _ = tmp;
     }
 
     #[test]
