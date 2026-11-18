@@ -84,7 +84,21 @@ fn ancestors_of(path: &Path) -> Vec<&Path> {
 
 /// Lexically normalize an absolute path: resolve `.` and inner `..`, strip
 /// trailing slashes. Returns an error if the path is relative or escapes the root.
+///
+/// Paths carrying `"` or `\` (or control bytes) are rejected outright: they
+/// are emitted into backend isolation profiles, where a stray quote is profile
+/// injection — an attacker-controlled path could close the string literal and
+/// append arbitrary rules (e.g. `(allow default)`). Real paths with these
+/// bytes are pathological; the policy plane fails closed on them.
 pub fn normalize_absolute(raw: &str) -> Result<PathBuf> {
+    if raw
+        .chars()
+        .any(|c| matches!(c, '"' | '\\') | c.is_control())
+    {
+        return Err(Error::Policy(format!(
+            "filesystem policy paths must not contain quotes, backslashes, or control bytes: {raw:?}"
+        )));
+    }
     let path = Path::new(raw);
     if !path.is_absolute() {
         return Err(Error::Policy(format!(
