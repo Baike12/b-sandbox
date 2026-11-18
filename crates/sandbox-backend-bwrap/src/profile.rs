@@ -30,9 +30,11 @@ pub fn generate(
 ) -> Vec<String> {
     let rootfs = rootfs.to_string_lossy().into_owned();
     let mut argv: Vec<String> = vec![
-        // Isolation baseline.
+        // Isolation baseline. --new-privileges sets no_new_privs so setuid
+        // inside the sandbox can never escalate beyond the mapped user.
         "--unshare-all".into(),
         "--new-session".into(),
+        "--new-privileges".into(),
         "--die-with-parent".into(),
         // Proc/dev so the workload can inspect itself and use /dev/null etc.
         "--proc".into(),
@@ -132,7 +134,12 @@ mod tests {
     #[test]
     fn isolation_baseline_present() {
         let argv = fixture(FsPolicy::default(), default_net(), "/tmp/r");
-        for flag in ["--unshare-all", "--new-session", "--die-with-parent"] {
+        for flag in [
+            "--unshare-all",
+            "--new-session",
+            "--new-privileges",
+            "--die-with-parent",
+        ] {
             assert!(contains(&argv, flag), "{flag} missing");
         }
         assert!(contains(&argv, "--proc") && contains(&argv, "/proc"));

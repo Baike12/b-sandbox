@@ -95,6 +95,18 @@ INFO all live sandboxes terminated count=1
 INFO server drained; exiting      ← 进程退出（graceful drain 完成）
 ```
 
+崩溃恢复 + 单实例锁（release 二进制，2026-11-19）：
+
+```
+实例1 创建沙箱 → kill -9（模拟崩溃）
+实例2 启动：
+  WARN stealing a stale service lock from a dead process pid=…   ← 陈旧锁自动抢占
+  WARN removed orphaned sandbox directories from the previous run ← 崩溃遗留清理
+  GET /health → {"sandboxes":0, ...}                             ← 状态干净
+实例3 携同一 data_root 启动 → panic "another b-sandbox instance holds …" exit 101
+实例2 SIGTERM → drained exit
+```
+
 对应单元/集成证据：孤儿回收 `recover_orphans_removes_sandbox_dirs_but_not_templates`、服务锁三连测 `service_lock_*`、SSE 生命周期收口两条 `sse_stream_ends_*`、panic 降级与 413 信封两条、观测完整性 `http_metrics_follow_the_full_traffic_picture`。
 
 ## 6. 本轮发现并修复的真实缺陷
