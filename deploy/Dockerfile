@@ -21,8 +21,11 @@ USER 10001
 ENV TZ=Asia/Shanghai
 EXPOSE 8094
 
+# The probe must check the BODY, not just "a 200 came back": a proxy or a
+# stale listener answering 200 with garbage would otherwise read as healthy.
+# status:"ok" (not "degraded") is the honest-tier contract.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
-  CMD wget -qO- http://127.0.0.1:8094/health || exit 1
+  CMD wget -qO- http://127.0.0.1:8094/health | grep -q '"status":"ok"' || exit 1
 
 # The container must listen on 0.0.0.0: a published port forwards to the
 # container IP, not its loopback. The host-side publish address stays

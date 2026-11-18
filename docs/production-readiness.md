@@ -24,7 +24,7 @@
 | --- | --- | --- | --- |
 | S1 | **优雅停机**：SIGTERM → 停止接流 → 清理在途工作 → 退出 | CubeSandbox `CubeAPI/src/main.rs:241` `with_graceful_shutdown`；CubeMaster `graceFullStop()` 120 s 上限 | ✅ `main.rs::shutdown_signal`：SIGTERM/SIGINT → 关停全部沙箱（单一终止路径）→ SSE 收口 → axum drain。真实二进制冒烟验证 |
 | S2 | **崩溃恢复**：启动时回收上次进程遗留的环境 | CubeSandbox `Cubelet/.../startup_recover.go`、microsandbox `maintenance.rs` 250 ms 预算扫描 | ✅ `reaper::recover_orphans`：启动即清理 `data_root/sandboxes/*`，模板不动，计数进 /metrics |
-| S3 | **单实例保护**：同一 data_root 禁止双实例（否则互相把对方沙箱当孤儿回收） | microsandbox SQLite 租约 + pidfd 存活校验 | ✅ `state::ServiceLock` pid 文件锁，死进程锁自动抢占 |
+| S3 | **单实例保护**：同一 data_root 禁止双实例（否则互相把对方沙箱当孤儿回收） | microsandbox SQLite 租约 + pidfd 存活校验 | ✅ `state::ServiceLock`：flock(LOCK_EX\|LOCK_NB)，内核随持有者 fd 消亡自动释放——容器内 pid 恒为 1 的 stale-pid crash loop 从模型上根除；锁文件内容仅诊断 |
 | S4 | panic 不得杀死连接 | （tower-http 是 Rust 生态标准做法） | ✅ `CatchPanicLayer` → 单连接降级为 internal 信封 500 |
 | S5 | 失败可分类：timeout ≠ backend 失败；错误码闭包 + 契约锁定 | mxc `MxcErrorCode` 12 变体含 `stale_id`；CubeSandbox `ReasonForTaskExit` | ✅ 闭包错误枚举 + `tests/contract.rs` 双向锁定；❗ `stale_id` 式"资源已消失"码未单列（404 已覆盖语义） |
 | S6 | 终止要证明，而非假设 | microsandbox `stop.rs:219-290` 循环重取生命周期锁 | ✅（进程后端：stop+deprovision 返回即清理完成；❗ microVM 级"证明终止"随 M3 落地） |
@@ -43,7 +43,7 @@
 
 | # | 标准 | 参考证据 | b-sandbox 状态 |
 | --- | --- | --- | --- |
-| R1 | 配额是声明式策略位，拒绝优于降级 | mxc `validator.rs` 每个能力位独立拒绝消息；b-sandbox 自有模型 | ✅ 9 个能力位 + `check_policy_support`；macOS 无 RLIMIT_AS 即拒绝 BUDGET_MEMORY（fail-closed） |
+| R1 | 配额是声明式策略位，拒绝优于降级 | mxc `validator.rs` 每个能力位独立拒绝消息；b-sandbox 自有模型 | ✅ 9 个能力位 + `check_policy_support`；macOS 无 RLIMIT_AS 即拒绝 BUDGET_MEMORY（fail-closed）。预算字段**存在即意图**（`Option` 模型）：显式设默认值（如 `memoryMb:2048`）同样需要后端可执行该上限，堵死"显式请求被当缺省"的绕过；rlimit 以硬上限写入（rlim_cur=rlim_max，工作负载无法自行抬回） |
 | R2 | 输出/输入有上限，防淹没 | microsandbox `ExecLimits`（1 MiB output）；E2B 流上限 | ✅ exec 输出字节帽 + truncated 标志 + 8 MiB 请求体上限 |
 | R3 | 服务自身资源占用可测量 | CubeSandbox 基准记录 18.7→24.6 MiB/VM @100→500 | ✅ `scripts/bench.sh` 输出 RSS（idle/20 沙箱） |
 | R4 | 空闲回收 | microsandbox `idle_timeout`；CubeMaster CLM 5 s 扫描 | ✅ idle-TTL reaper（15 s 扫描，7 天 TTL 上限，activity 由数据面驱动） |
@@ -84,7 +84,7 @@
 
 | # | 标准 | 参考证据 | b-sandbox 状态 |
 | --- | --- | --- | --- |
-| T1 | 对抗测试是产品 | mxc 5431 测试 + fuzz 目标；microsandbox 每测试独立 HOME | ✅ traversal/symlink/洪泛/fork bomb/egress/僵尸（backend 测试套件） |
+| T1 | 对抗测试是产品 | mxc 5431 测试 + fuzz 目标；microsandbox 每测试独立 HOME | ✅ traversal/symlink/悬空 symlink/洪泛/fork bomb（差分证据：上限 2048 完成 vs 上限 64 EAGAIN）/profile 注入/终止后进程组回收/egress 私网拒绝/body 走私（backend + proxy 测试套件） |
 | T2 | 契约测试锁 API 面 | E2B 契约即产品 | ✅ 见 M4 |
 | T3 | 性能预算即测试（标定而非拍脑袋） | CubeSandbox cubebench 公布测量方法 | ✅ perf.rs 预算注释含测量日期与基线 |
 | T4 | 每个能力位有执行证据 | mxc 每 backend 能力位 pin by test | ✅ 项目第一原则（AGENTS.md） |

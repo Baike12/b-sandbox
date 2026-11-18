@@ -505,6 +505,7 @@ dependencies = [
  "sandbox-egress-proxy",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

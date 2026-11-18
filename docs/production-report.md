@@ -8,7 +8,7 @@
 
 | 维度 | 结论 | 证据（可复现） |
 | --- | --- | --- |
-| 质量门 | **23 个测试套件 / 197 个测试全部通过，0 失败** | `./scripts/gate.sh`（fmt --check + clippy -D warnings + test --workspace） |
+| 质量门 | **23 个测试套件 / 220 个测试全部通过，0 失败** | `./scripts/gate.sh`（fmt --check + clippy -D warnings + test --workspace） |
 | 隔离执行证据 | 每个能力位都有翻转测试：路径逃逸拒绝、symlink 逃逸拒绝、输出洪泛截断、fork bomb 受限、网络默认拒绝、egress 凭据注入正向+负向、僵尸回收 | `cargo test -p sandbox-backend-seatbelt`（含 `proxy_mode_egress_goesthrough_the_credential_proxy` 真实 curl 经代理 → 上游看到注入头） |
 | 契约锁定 | 路由 ↔ OpenAPI ↔ 错误码三向契约测试通过；spec v0.3.0 | `cargo test -p sandbox-api --test contract` |
 | 性能 | API 单周期 0.195 ms（门槛 2 ms）；并行 ~2 700 cycles/s（门槛 300）；Seatbelt echo p50 8.3 ms / p99 19.5 ms（门槛 mean 50 ms） | `cargo test -p sandbox-api --test perf` + `cargo test --workspace --test bench -- --ignored --nocapture` |
@@ -20,7 +20,7 @@
 
 命令：`./scripts/gate.sh`（= `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`）
 
-最近一次全绿运行：**exit 0，23 个 `test result: ok` 行，197 passed / 0 failed**。套件构成：
+最近一次全绿运行：**exit 0，23 个 `test result: ok` 行，220 passed / 0 failed**（含第二轮评审修复新增的 18 个测试）。套件构成：
 
 | crate | 套件 | 覆盖 |
 | --- | --- | --- |
@@ -120,6 +120,52 @@ INFO server drained; exiting      ← 进程退出（graceful drain 完成）
 | `/var/folders` vs `/private/var/folders`：bench 后端 rootfs 未 canonicalize → 文件面全部 400 | P2（测试） | bench 首跑 | canonicalize（tests/bench.rs） |
 | scripts/bench.sh 末尾 `wait` 在 trap 发 SIGTERM 前执行 → 死等 | P2（脚本） | 首跑挂起 | 删除该行（scripts/bench.sh） |
 | egress 代理目的地不设限：net.proxy 沙箱可借 CONNECT 隧道打宿主机 loopback 服务/169.254.169.254/RFC1918（代理进程不受沙箱约束） | **P0（安全）** | 对标 microsandbox 网络隔离文档自查 | `EgressPolicy::DenyPrivate` 默认 + DNS 解析校验 + 403/502 可观测拒绝（commit 93d5358） |
+
+### 6.1 第二轮：三份独立评审（安全 / 契约 / 可观测）修复记录
+
+三个评审 agent 以"对比成熟开源项目 + 代码取证 + 可执行复现"的方式各出一份带证据的报告。全部 P0 与绝大多数 P1/P2 已修复并有对应测试：
+
+**安全评审（4×P0）**
+
+| 缺陷 | 证据（复现方式） | 修复 | 测试 |
+| --- | --- | --- | --- |
+| Seatbelt profile 注入：策略路径含 `"`/`\` 可闭合 scheme 注入 `(allow default)` | 构造 `subpath "/x")) (allow default ;` 路径 | 路径字符白名单（`normalize_absolute` 拒绝 `"`/`\`/控制字符）+ 全部插值点 `quote()` 转义 | `quoted_paths_cannot_inject_rules` |
+| 悬空 symlink 逃逸：`allow_missing` 分支只做词法拼接，尾部悬空 symlink 在内核时才解析 → 可写逃逸 | 在 rootfs 放悬空 symlink 指向沙箱外 | 每个追加组件 `symlink_metadata` 检查，命中即 400 | `dangling_symlink_tail_is_rejected` |
+| 终止后进程存活：workload `nohup … &` 后 DELETE，子进程带 host 权限继续跑 | pgrep 观察到评审期真实残留进程（已清杀） | 后端记录每个 exec 的 pgid，`stop()` 对进程组 `kill(-pgid, SIGKILL)` | `backgrounded_workload_dies_with_its_sandbox` |
+| `{"budget":{"memoryMb":2048}}` 绕过 macOS 层 BUDGET_MEMORY 拒绝（字段默认值 = 请求值，"存在性"信息丢失） | 真实 HTTP 请求实测：修复前 201，修复后 400（本报告 §5 冒烟复验） | Budget 字段改 `Option`：**存在即意图**（absent=默认，Some=enforce-or-reject），`check_policy_support` 按存在性判定 | `explicit_default_valued_budget_still_requires_the_capability` + spec/SDK 同步更新 |
+
+**契约评审（5×P0）**
+
+| 缺陷 | 修复 | 测试 |
+| --- | --- | --- |
+| spec `net` schema 与真实模型脱节（含残留的重复 `type:` 行） | 重写为 `{egressDefault: deny\|allow, allow/deny: [{target}], proxy}`，与 `NetPolicy` 序列化一一对应 | `net_policy_schema_matches_serialization`（键集精确相等） |
+| spec 事件枚举含死枚举 `sandbox_killed`/`policy_denied`、缺 `template_committed` | 模型删除两个从未发出的变体，spec 枚举对齐实际发射面 | `events_serialize_snake_case` + spec 枚举 |
+| spec 无默认 security、无 401/413 响应 | 顶层 `security: [bearerAuth]` + `/health` 显式豁免 + 401/413 response 组件 | spec 手工核对 + 契约测试 |
+| Budget wire 契约无"显式 vs 缺省"语义 | 同上 Option 模型；spec budget 字段注明存在性语义并加 min/max | `budget_schema_matches_serialization` |
+| SDK 无任何超时：死服务器挂死调用方 | 连接超时 10s + 全请求 deadline 60s（可调）+ exec 按调用方预算+30s 余量 | SDK live 测试 |
+
+**可观测评审（4×P0 + P1/P2）**
+
+| 缺陷 | 修复 | 测试 |
+| --- | --- | --- |
+| `http_in_flight` 只减不增（RAII 补丁漏掉构造期 inc）→ gauge 负数 | `InFlightGauge::new` 统一 inc | `http_metrics_follow_the_full_traffic_picture`（in-flight 断言） |
+| 413/panic 不进指标（observe 在 body-limit/panic 层内层） | 层序重排：catch-panic → body-limit → observe → auth | `oversized_body_is_a_413_envelope`（新增 413 计数断言） |
+| method 标签开放集合（任意 token 方法可稀释基数）+ HEAD 独立成系列 | `label_method` 闭集（未知→OTHER），HEAD 归一到 GET 路由 | `head_requests_are_counted_under_their_get_route` |
+| 服务锁 pid 文件在容器内恒为 1 → crash loop | flock(LOCK_EX\|LOCK_NB)，内容仅诊断；内核随 fd 释放 | `service_lock_*` 三连测 |
+| SSE 慢客户端塞满 64 槽 → drain 阻塞 | tail 的 send 与 shutdown flag 用 `biased select!` 竞争 | `sse_stream_ends_when_the_server_drains` |
+| egress 代理 read_head 单次 read 混入 body 字节被当 header 重解析（走私） | read_head 拆 `(head, leftover)`，body 原样先行转发 | `request_body_bytes_stay_body_not_headers` |
+| egress 代理无连接上限/读头无超时/JSON 未转义 | Semaphore(1024) + 满载 503、HEAD_TIMEOUT 5s、serde_json 构造错误体 | `cargo test -p sandbox-egress-proxy` |
+| 文件操作 io 错误一律 502 | 按 ErrorKind 分类：调用方错误（IsADirectory/NotADirectory/InvalidInput/NotFound/PermissionDenied）→ 400，仅宿主故障 → 502 | files/routes 路径测试 |
+| Query 参数错误返回 axum 纯文本 | `ApiQuery` 信封化（与 ApiJson 同一错误形状） | api 套件 |
+| 账本计数器可溢出 panic | `saturating_add` 全套 | ledger 单测 |
+| `new_sandbox_id` 在请求路径 panic | 返回 `Result` → internal 信封 | api 套件 |
+
+**其余**
+
+- bwrap：`--unshare-all` → 显式 unshare 集（`--unshare-pid/ipc/uts/cgroup-try`），deny 姿态才 `--unshare-net`——修复"allow 姿态静默拒绝"的死代码（`allow_posture_shares_the_host_net_namespace`）；provision 模板失败清理半成品 rootfs；children/pgid 追踪与 `stop()` 组杀对齐 seatbelt。
+- 日志：`B_SANDBOX_LOG`（不再读 RUST_LOG）+ ANSI 关闭（容器采集无需去转义序列）；SANDBOX_DEBUG_PROFILE eprintln → tracing::debug。
+- Dockerfile HEALTHCHECK 校验响应体 `"status":"ok"`，不再被任意 200 欺骗。
+- **fork bomb 差分对抗测试**（`pids_ceiling_refuses_a_fork_bomb`）：同一探针两种预算——上限 2048 时探针完成、上限 64 时 fork EAGAIN 拒绝（stderr 实证）。此前报告"fork bomb 受限"一行缺少真实执行证据，本测试补齐。
 
 ## 7. 复现清单
 
