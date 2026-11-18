@@ -33,6 +33,21 @@ cargo run -p sandbox-api -- --data-root /data/b-sandbox --backend bwrap \
   --bind 0.0.0.0 --egress-proxy 127.0.0.1:8095 --egress-credentials /etc/b-sandbox/egress.json
 ```
 
+## Web 控制台与新手指引
+
+API 服务自带 Web 控制台（构建后由服务直接托管）：
+
+```bash
+cd web && pnpm install && pnpm build   # 产出 web/dist
+cd .. && cargo run -p sandbox-api -- --data-root /tmp/b-sandbox
+# 打开 http://127.0.0.1:8094/ → 自动跳转 /console
+```
+
+- **上手指引**（默认首页，参考 Microsoft Copilot Studio 的 first-run 清单模式）：四步任务卡——连上服务 → 创建并配置沙箱 → 管理沙箱 → 评测性能。每步自动检测完成证据（health 探测成功 / 创建成功 / 执行成功 / 自测完成），也可手动标记；首次访问有页面导览（spotlight tour），可跳过、可随时从顶栏重放。
+- **创建沙箱**：声明式策略表单（fs/net/exec/budget），三个示例预设（最严默认 / 常用读写 / 凭据代理），字段旁标注最严格默认值与语义。
+- **沙箱管理**：列表 + 详情（usage 账本、事件日志轮放）、执行命令、文件读写、暂停/恢复/终止、提交模板。
+- **指标与评测**：`/metrics` 抓取 + **评测标准表**（每项指标的健康阈值与测量方法）+ 性能自测（50 次真实 echo 计算 p50/p95/均值，对照 ≤50 ms 门槛判定）。
+
 ## 仓库结构
 
 见 [AGENTS.md](AGENTS.md) 的结构表。API 契约在 [docs/openapi.yaml](docs/openapi.yaml)（OpenAPI 3.0.3，`tests/contract.rs` 三向锁定路由↔契约↔错误码），Rust SDK 在 `crates/sandbox-sdk/`。

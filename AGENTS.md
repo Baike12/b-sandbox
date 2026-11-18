@@ -55,7 +55,12 @@ crates/sandbox-egress-proxy/     credential-injection egress proxy (lib + standa
                                  net.proxy sandboxes get one loopback hole + proxy env vars
 crates/sandbox-sdk/              typed Rust client; live-TCP tests against the real router
 docs/openapi.yaml                versioned API contract (v0.3.0); tests/contract.rs locks routes+codes
-web/                             not yet (M3+: console)
+web/                             TypeScript (strict) + React + Vite console: onboarding
+├── src/logic/                   pure logic (router, metrics parser, percentiles,
+│                                onboarding reducer) — vitest-covered, no UI glue
+├── src/api/                     fetch client + wire types mirroring openapi.yaml
+├── src/pages/                   guide (checklist + tour) / sandboxes / create / metrics
+└── src/components/              shell, tour spotlight, presentational bits
 ```
 
 ### Key Concepts
