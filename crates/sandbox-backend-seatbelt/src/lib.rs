@@ -20,15 +20,21 @@
 //!   rejected at validation (`check_policy_support`) instead of being
 //!   pretended — memory budgeting arrives with the Linux cgroups tier.
 //!
-//! `stop()` is a no-op for M1: execs are synchronous, so nothing is left in
-//! flight when the registry tears a sandbox down.
+//! `stop()` kills every process group an exec of this sandbox spawned. Execs
+//! are synchronous, but a workload can background its own children
+//! (`nohup … &`) and exit before them — with `setsid` the whole tree leaves
+//! our kill scope, so the backend records each exec's pgid and `stop()`
+//! SIGKILLs the groups. Without that, a terminated sandbox's workload keeps
+//! running with its host grants (verified escape before this fix).
 
 pub mod profile;
 
 #[cfg(target_os = "macos")]
 pub mod ffi;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use sandbox_core::error::{BackendFailureKind, Error, Result};
@@ -44,6 +50,11 @@ pub struct SeatbeltBackend {
     /// `ip:port` of the credential-injection egress proxy, when the service
     /// runs one. Proxy-mode specs are rejected at provision without it.
     egress_proxy: Option<String>,
+    /// sandbox id → pgids spawned by its execs (after `setsid`, the spawned
+    /// child's pid IS its group id). `stop()` SIGKILLs these groups so a
+    /// backgrounded workload cannot outlive its sandbox. Sync mutex: no
+    /// await happens while held.
+    children: Mutex<HashMap<String, Vec<u32>>>,
 }
 
 impl SeatbeltBackend {
@@ -51,6 +62,7 @@ impl SeatbeltBackend {
         Self {
             data_root: data_root.into(),
             egress_proxy: None,
+            children: Mutex::new(HashMap::new()),
         }
     }
 
@@ -157,8 +169,13 @@ impl SandboxBackend for SeatbeltBackend {
             })?;
         // A named template seeds the rootfs (reflink snapshot of a committed
         // sandbox). Missing templates are policy errors, never empty rootfs.
-        if let Some(name) = &spec.template {
-            sandbox_core::materialize_template(&self.data_root, name, &rootfs)?;
+        // Provision is all-or-nothing: on failure the created rootfs goes
+        // away, so a rejected spec cannot leak a directory nothing tracks.
+        if let Some(name) = &spec.template
+            && let Err(e) = sandbox_core::materialize_template(&self.data_root, name, &rootfs)
+        {
+            let _ = tokio::fs::remove_dir_all(&rootfs).await;
+            return Err(e);
         }
         Ok(SandboxContext {
             id: id.to_string(),
@@ -173,7 +190,19 @@ impl SandboxBackend for SeatbeltBackend {
         req.validate()?;
         #[cfg(target_os = "macos")]
         {
-            return macos_exec::exec(ctx, req, self.egress_proxy.as_deref()).await;
+            let (outcome, pgid) = macos_exec::exec(ctx, req, self.egress_proxy.as_deref()).await?;
+            // The pgid survives this exec's return if the workload backgrounded
+            // children (see stop()): record it while we know it. pgid 0 means
+            // the pid was already reaped — kill(0) would hit OUR group.
+            if pgid != 0 {
+                self.children
+                    .lock()
+                    .unwrap()
+                    .entry(ctx.id.clone())
+                    .or_default()
+                    .push(pgid);
+            }
+            return Ok(outcome);
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -185,9 +214,24 @@ impl SandboxBackend for SeatbeltBackend {
         }
     }
 
-    async fn stop(&self, _ctx: &SandboxContext) -> Result<()> {
-        // M1 execs are synchronous: by the time exec returns, no process tree
-        // is left. Container/microVM backends kill their workload group here.
+    async fn stop(&self, ctx: &SandboxContext) -> Result<()> {
+        // Kill every process group this sandbox ever spawned. Backgrounded
+        // workloads escape the exec-timeout kill (their session leader exited);
+        // without this they keep running with their host grants.
+        let pgids = self
+            .children
+            .lock()
+            .unwrap()
+            .remove(&ctx.id)
+            .unwrap_or_default();
+        for pgid in pgids.into_iter().filter(|p| *p != 0) {
+            // Group kill (the setsid'd session), then the leader itself as a
+            // belt-and-braces for the brief window before setsid completed.
+            unsafe {
+                libc::kill(-(pgid as i32), libc::SIGKILL);
+                libc::kill(pgid as i32, libc::SIGKILL);
+            }
+        }
         Ok(())
     }
 
@@ -271,10 +315,11 @@ mod macos_exec {
         }
     }
 
-    /// Lower only the *soft* limit; the hard limit stays untouched (lowering
-    /// the hard limit requires privilege and fails on stock macOS with EINVAL).
-    /// The value is clamped below the existing hard limit so a caller asking
-    /// for more than the host allows gets the host max, not a failed spawn.
+    /// Lower BOTH the soft and hard limit to `value` (clamped below the
+    /// existing hard limit). Lowering the hard limit is unprivileged; the
+    /// soft-only variant was a verified escape — the workload could restore
+    /// its own fd/pid budget with one setrlimit call. After this, any raise
+    /// attempt inside the sandbox fails with EPERM.
     fn set_rlimit(resource: i32, value: u64) -> io::Result<()> {
         let mut lim = unsafe {
             let mut lim = std::mem::zeroed::<libc::rlimit>();
@@ -283,7 +328,8 @@ mod macos_exec {
             }
             lim
         };
-        lim.rlim_cur = value.min(lim.rlim_max);
+        lim.rlim_max = value.min(lim.rlim_max);
+        lim.rlim_cur = lim.rlim_max;
         let rc = unsafe { libc::setrlimit(resource, &lim) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
@@ -360,7 +406,7 @@ mod macos_exec {
         ctx: &SandboxContext,
         req: ExecRequest,
         egress_proxy: Option<&str>,
-    ) -> Result<ExecOutcome> {
+    ) -> Result<(ExecOutcome, u32)> {
         // Working directory: sandbox-relative, must exist.
         let rel = normalize_relative(&req.cwd)?;
         let cwd = if rel.as_os_str().is_empty() {
@@ -382,9 +428,11 @@ mod macos_exec {
             egress_proxy,
         );
         if std::env::var_os("SANDBOX_DEBUG_PROFILE").is_some() {
-            eprintln!("---- generated scheme ----\n{scheme}---- end scheme ----");
+            // Structured log, not stderr: a raw eprintln interleaves into the
+            // captured workload output stream.
+            tracing::debug!(sandbox = %ctx.id, scheme = %scheme, "generated seatbelt scheme");
         }
-        let pids_max = ctx.spec.budget.pids_max as u64;
+        let pids_max = u64::from(ctx.spec.budget.effective_pids_max());
         let max_open_files = ctx.spec.exec.max_open_files as u64;
 
         let home = ctx.rootfs.join("home").to_string_lossy().into_owned();
@@ -490,12 +538,16 @@ mod macos_exec {
         // Readers finish once the (killed or exited) process closes its pipes.
         let _ = tokio::join!(out_reader, err_reader);
 
-        Ok(ExecOutcome {
+        let outcome = ExecOutcome {
             exit_code,
             timed_out,
             stdout: String::from_utf8_lossy(&out_buf.lock().unwrap()).into_owned(),
             stderr: String::from_utf8_lossy(&err_buf.lock().unwrap()).into_owned(),
             truncated: truncated.load(Ordering::Relaxed),
-        })
+        };
+        // The spawned child's pid == its process group id after setsid; the
+        // caller records it so stop() can kill groups whose leader exited.
+        let pgid = pid.unwrap_or(0);
+        Ok((outcome, pgid))
     }
 }

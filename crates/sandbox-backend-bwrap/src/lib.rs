@@ -19,8 +19,10 @@
 
 pub mod profile;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use sandbox_core::backend::EXEC_TIMEOUT_MS_CEILING;
@@ -36,12 +38,18 @@ use tokio::process::Command;
 pub struct BwrapBackend {
     /// Directory under which sandbox rootfs directories are created.
     data_root: PathBuf,
+    /// sandbox id → pgids spawned by its execs (each exec sets
+    /// `process_group(0)`, so pgid == the bwrap pid). `stop()` kills these
+    /// groups: backgrounded workloads escape the exec-timeout kill (their
+    /// session leader exited) and would otherwise keep running after DELETE.
+    children: Mutex<HashMap<String, Vec<u32>>>,
 }
 
 impl BwrapBackend {
     pub fn new(data_root: impl Into<PathBuf>) -> Self {
         Self {
             data_root: data_root.into(),
+            children: Mutex::new(HashMap::new()),
         }
     }
 
@@ -73,9 +81,9 @@ impl BwrapBackend {
 /// readers cannot overshoot the cap together).
 async fn read_capped(
     mut pipe: impl tokio::io::AsyncRead + Unpin,
-    budget: std::sync::Arc<std::sync::Mutex<i64>>,
+    budget: std::sync::Arc<Mutex<i64>>,
     truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    buf: std::sync::Arc<Mutex<Vec<u8>>>,
 ) -> std::io::Result<()> {
     use std::sync::atomic::Ordering;
 
@@ -172,8 +180,14 @@ impl SandboxBackend for BwrapBackend {
             })?;
         // A named template seeds the rootfs (reflink snapshot of a committed
         // sandbox). Missing templates are policy errors, never empty rootfs.
-        if let Some(name) = &spec.template {
-            sandbox_core::materialize_template(&self.data_root, name, &rootfs)?;
+        if let Some(name) = &spec.template
+            && let Err(e) = sandbox_core::materialize_template(&self.data_root, name, &rootfs)
+        {
+            // A failed provision must not leave a half-built rootfs the
+            // registry no longer tracks (it would resurface as a phantom
+            // orphan on the next boot).
+            let _ = tokio::fs::remove_dir_all(&rootfs).await;
+            return Err(e);
         }
         Ok(SandboxContext {
             id: id.to_string(),
@@ -220,7 +234,7 @@ impl SandboxBackend for BwrapBackend {
         // Process group (for the timeout kill) and rlimits (applied inside
         // the sandbox — pre_exec runs in the bwrap'd child before it execs
         // the workload) both set on the underlying std command.
-        let pids_max = ctx.spec.budget.pids_max as u64;
+        let pids_max = u64::from(ctx.spec.budget.effective_pids_max());
         let max_open_files = ctx.spec.exec.max_open_files as u64;
         {
             use std::os::unix::process::CommandExt as _;
@@ -239,6 +253,16 @@ impl SandboxBackend for BwrapBackend {
             message: format!("spawn bwrap {:?}: {e}", req.command),
         })?;
         let pid = child.id();
+        // Record the pgid while we know it; stop() kills the whole group even
+        // after this exec returns (backgrounded children outlive the leader).
+        if let Some(pid) = pid {
+            self.children
+                .lock()
+                .unwrap()
+                .entry(ctx.id.clone())
+                .or_default()
+                .push(pid);
+        }
 
         let stdout_pipe = child
             .stdout
@@ -249,11 +273,10 @@ impl SandboxBackend for BwrapBackend {
             .take()
             .ok_or_else(|| Error::Internal("stderr pipe missing".into()))?;
 
-        let budget =
-            std::sync::Arc::new(std::sync::Mutex::new(ctx.spec.exec.max_output_bytes as i64));
-        let truncated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let budget = Arc::new(Mutex::new(ctx.spec.exec.max_output_bytes as i64));
+        let truncated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+        let err_buf = Arc::new(Mutex::new(Vec::new()));
 
         let out_reader = tokio::spawn(read_capped(
             stdout_pipe,
@@ -301,8 +324,24 @@ impl SandboxBackend for BwrapBackend {
         })
     }
 
-    async fn stop(&self, _ctx: &SandboxContext) -> Result<()> {
-        // M1 execs are synchronous; nothing left in flight.
+    async fn stop(&self, ctx: &SandboxContext) -> Result<()> {
+        // Kill every process group this sandbox ever spawned. Backgrounded
+        // workloads escape the exec-timeout kill (their session leader
+        // exited); without this they keep running after DELETE.
+        let pgids = self
+            .children
+            .lock()
+            .unwrap()
+            .remove(&ctx.id)
+            .unwrap_or_default();
+        for pgid in pgids.into_iter().filter(|p| *p != 0) {
+            // Group kill, then the leader itself for the brief window before
+            // the group formed.
+            unsafe {
+                libc::kill(-(pgid as i32), libc::SIGKILL);
+                libc::kill(pgid as i32, libc::SIGKILL);
+            }
+        }
         Ok(())
     }
 

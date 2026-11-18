@@ -70,8 +70,8 @@ mod tests {
     fn budget_section_validates_with_the_spec() {
         let json = r#"{"budget": {"memoryMb": 512, "pidsMax": 64}}"#;
         let spec: SandboxSpec = serde_json::from_str(json).unwrap();
-        assert_eq!(spec.budget.memory_mb, 512);
-        assert_eq!(spec.budget.pids_max, 64);
+        assert_eq!(spec.budget.memory_mb, Some(512));
+        assert_eq!(spec.budget.pids_max, Some(64));
         spec.validate().unwrap();
 
         let json = r#"{"budget": {"memoryMb": 0}}"#;

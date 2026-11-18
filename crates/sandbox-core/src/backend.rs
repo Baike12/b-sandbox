@@ -112,18 +112,16 @@ pub fn check_policy_support(spec: &SandboxSpec, caps: BackendCapabilities) -> Re
     // treated as "no opinion" — the backend's platform tier stays visible in
     // /health, so the caller can see what is (not) being enforced. Memory
     // budgets are only enforceable on the Linux tier (see BUDGET_MEMORY docs).
-    if !caps.has(BackendCapabilities::BUDGET_MEMORY)
-        && spec.budget.memory_mb != crate::budget::Budget::default().memory_mb
-    {
+    // Presence is intent: an explicit field must be enforceable or the
+    // request is rejected — even when the value equals the default.
+    if !caps.has(BackendCapabilities::BUDGET_MEMORY) && spec.budget.memory_mb.is_some() {
         return Err(Error::Policy(
             "backend cannot enforce a memory budget (no BUDGET_MEMORY capability); \
              memory budgets require the Linux tier"
                 .into(),
         ));
     }
-    if !caps.has(BackendCapabilities::BUDGET_PIDS)
-        && spec.budget.pids_max != crate::budget::Budget::default().pids_max
-    {
+    if !caps.has(BackendCapabilities::BUDGET_PIDS) && spec.budget.pids_max.is_some() {
         return Err(Error::Policy(
             "backend cannot enforce a pids ceiling (no BUDGET_PIDS capability)".into(),
         ));
@@ -174,6 +172,9 @@ pub const EXEC_TIMEOUT_MS_CEILING: u64 = 600_000;
 
 /// Hard ceiling on argv length (count of args).
 pub const EXEC_MAX_ARGS: usize = 1024;
+/// Command-line length cap. Argv of real processes is bounded by ARG_MAX
+/// anyway; this is the API-side guard the spec documents (maxLength 4096).
+pub const EXEC_MAX_COMMAND_LEN: usize = 4096;
 
 impl ExecRequest {
     /// Validate request shape. Domain-level invariants only; backend-specific
@@ -181,6 +182,11 @@ impl ExecRequest {
     pub fn validate(&self) -> Result<()> {
         if self.command.trim().is_empty() {
             return Err(Error::Policy("exec command must not be empty".into()));
+        }
+        if self.command.len() > EXEC_MAX_COMMAND_LEN {
+            return Err(Error::Policy(format!(
+                "exec command exceeds {EXEC_MAX_COMMAND_LEN} bytes"
+            )));
         }
         if self.command.contains('\0') || self.args.iter().any(|a| a.contains('\0')) {
             return Err(Error::Policy(
@@ -404,9 +410,25 @@ mod tests {
         let caps = BackendCapabilities::NET_EGRESS_DEFAULT.union(PIDS_TIER);
         let spec = SandboxSpec {
             budget: crate::budget::Budget {
-                memory_mb: 512,
-                pids_max: 64,
+                memory_mb: Some(512),
+                pids_max: Some(64),
             },
+            ..Default::default()
+        };
+        let err = check_policy_support(&spec, caps).unwrap_err();
+        assert_eq!(err.code(), "policy_validation");
+        assert!(err.to_string().contains("BUDGET_MEMORY"), "{err}");
+    }
+
+    #[test]
+    fn explicit_default_valued_budget_still_requires_the_capability() {
+        // The regression this test locks: with defaulted fields, the wire
+        // payload `{"budget":{"memoryMb":2048}}` (2048 == the default) parsed
+        // into "no request" and slipped past this check. Presence must be the
+        // signal, not the value.
+        let caps = BackendCapabilities::NET_EGRESS_DEFAULT.union(PIDS_TIER);
+        let spec = SandboxSpec {
+            budget: serde_json::from_str(r#"{"memoryMb": 2048}"#).expect("parses"),
             ..Default::default()
         };
         let err = check_policy_support(&spec, caps).unwrap_err();
@@ -421,8 +443,8 @@ mod tests {
             .union(BackendCapabilities::BUDGET_NOFILE);
         let spec = SandboxSpec {
             budget: crate::budget::Budget {
-                memory_mb: 2048,
-                pids_max: 64,
+                memory_mb: Some(2048),
+                pids_max: Some(64),
             },
             ..Default::default()
         };

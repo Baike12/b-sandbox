@@ -22,8 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// Default posture for egress traffic.
+/// Default posture for egress traffic. Wire spelling is lowercase to match
+/// the rest of the JSON contract (`deny`/`allow`, as in the OpenAPI enum).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EgressDefault {
     #[default]
     Deny,
