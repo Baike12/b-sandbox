@@ -15,7 +15,11 @@ info:
     Isolated environments for untrusted agent workloads: declarative
     fs/net/exec policy, per-sandbox budget and usage ledger, idle-TTL
     reaping, pause/resume lifecycle. E2B-compatible where it costs nothing.
-  version: 0.3.0
+  version: 0.4.0
+  # 0.4.0: budget fields gained presence semantics (a set field is an
+  # explicit request, not a default), and egressDefault's wire spelling
+  # settled to lowercase. No v0.3.0 client could rely on the old shapes:
+  # the net schema was structurally broken in that revision.
 servers:
   - url: /
 tags:
