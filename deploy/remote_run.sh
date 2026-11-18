@@ -24,8 +24,18 @@ fi
 echo ">>> build image ${IMAGE}"
 docker build --build-arg "BASE_IMAGE=${BASE_IMAGE}" -t "${IMAGE}" "${APP_DIR}"
 
-echo ">>> point the compose project at that tag"
-printf 'B_SANDBOX_TAG=%s\n' "${TAG}" > "${ENV_FILE}"
+echo ">>> point the compose project at that tag (keeping the auth token)"
+# The compose file refuses to start without B_SANDBOX_AUTH_TOKEN. Keep an
+# existing token across deploys; generate one on first deploy. The file is
+# 0600 and lives outside the repo and the image.
+if [ -f "${ENV_FILE}" ] && grep -q '^B_SANDBOX_AUTH_TOKEN=' "${ENV_FILE}"; then
+  TOKEN_LINE="$(grep '^B_SANDBOX_AUTH_TOKEN=' "${ENV_FILE}")"
+else
+  TOKEN_LINE="B_SANDBOX_AUTH_TOKEN=$(openssl rand -hex 32 2>/dev/null \
+    || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  echo ">>> generated a new B_SANDBOX_AUTH_TOKEN in ${ENV_FILE} (give it to API callers)"
+fi
+printf 'B_SANDBOX_TAG=%s\n%s\n' "${TAG}" "${TOKEN_LINE}" > "${ENV_FILE}"
 chmod 600 "${ENV_FILE}"
 
 echo ">>> start the compose project"

@@ -19,6 +19,12 @@ services:
       - ${B_SANDBOX_DATA_DIR:-/opt/b-sandbox/data}:/app/data
     environment:
       TZ: Asia/Shanghai
+      # Fail loud: the compose stack does not come up without a token. Put
+      # the value in the deploy .env (0600, never in the repo or image).
+      B_SANDBOX_AUTH_TOKEN: ${B_SANDBOX_AUTH_TOKEN:?set B_SANDBOX_AUTH_TOKEN in the deploy .env}
+    # SIGTERM → our graceful drain (terminate sandboxes, close SSE) must
+    # finish before the kill; 10 s default is tight for large rootfs deletes.
+    stop_grace_period: 30s
     read_only: true
     tmpfs:
       - /tmp:size=16m
